@@ -10,6 +10,7 @@ import importlib.util
 import torch
 
 from data.dataset import MockTextDataset
+from models.cdm_engine import OffTrajectoryConfig
 from models.student_mamba import MockStudentMamba
 from models.teacher_wrapper import MockTeacherWrapper
 
@@ -77,6 +78,46 @@ def test_student_fake_logits_detached_and_loss_gradients() -> None:
     assert student.embedding.weight.grad is not None
     assert student.embedding.weight.grad.abs().sum() > 0
     assert all(parameter.grad is None for parameter in teacher.parameters())
+
+
+def test_mock_student_casts_delta_surrogate_to_hidden_dtype_and_keeps_gradients() -> None:
+    class Float64DeltaProjection(torch.nn.Module):
+        def __init__(self, projection: torch.nn.Module) -> None:
+            super().__init__()
+            self.projection = projection
+
+        def forward(self, h: torch.Tensor) -> torch.Tensor:
+            return self.projection(h).double()
+
+    student = MockStudentMamba(
+        vocab_size=32,
+        hidden_size=16,
+        off_config=OffTrajectoryConfig(
+            noise_sigma=0.0,
+            rho_min=1.0,
+            rho_max=1.0,
+            detach_direction=False,
+        ),
+    )
+    student.delta_perturb_proj = Float64DeltaProjection(student.delta_perturb_proj)
+    input_ids = torch.randint(0, 32, (2, 8))
+
+    output = student(input_ids)
+    loss = output.on_logits.float().mean() + output.off_logits.float().mean()
+    loss.backward()
+
+    assert output.h_delta_alt.dtype == output.h.dtype
+    assert output.h_delta_alt.device == output.h.device
+    assert output.h_delta_alt.requires_grad
+    assert output.on_logits.shape == (2, 8, 32)
+    assert output.off_logits.shape == output.on_logits.shape
+    assert output.fake_logits.shape == output.off_logits.shape
+    assert not output.fake_logits.requires_grad
+    assert student.embedding.weight.grad is not None
+    assert student.embedding.weight.grad.abs().sum() > 0
+    projection = student.delta_perturb_proj.projection
+    assert projection.weight.grad is not None
+    assert projection.weight.grad.abs().sum() > 0
 
 
 def test_train_mock_subprocess_runs_two_optimizer_steps() -> None:

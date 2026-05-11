@@ -64,6 +64,7 @@ class MockStudentMamba(StudentMamba):
         on_logits = self.lm_head(h)
 
         h_delta_alt = h + self.delta_scale * torch.tanh(self.delta_perturb_proj(h))
+        h_delta_alt = h_delta_alt.to(device=h.device, dtype=h.dtype)
         h_off = self.off_engine.make_off_state(h, h_delta_alt=h_delta_alt)
         off_logits = self.lm_head(h_off)
 
