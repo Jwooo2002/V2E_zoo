@@ -4,9 +4,11 @@ import json
 import math
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 import importlib.util
 
+import pytest
 import torch
 
 from data.dataset import MockTextDataset
@@ -24,6 +26,8 @@ sys.modules[TRAIN_SPEC.name] = train_module
 TRAIN_SPEC.loader.exec_module(train_module)
 compute_losses = train_module.compute_losses
 load_train_config = train_module.load_train_config
+run_training = train_module.run_training
+LogitCacheConfig = train_module.LogitCacheConfig
 
 
 def test_mock_dataset_next_token_shift_and_ignore_index() -> None:
@@ -130,6 +134,8 @@ def test_train_mock_subprocess_runs_two_optimizer_steps() -> None:
             "--mock",
             "--max_steps",
             "2",
+            "--gradient-accumulation-steps",
+            "1",
         ],
         cwd=ROOT,
         text=True,
@@ -145,6 +151,146 @@ def test_train_mock_subprocess_runs_two_optimizer_steps() -> None:
         for key in ("total", "ce", "kd", "csdm", "grad_norm"):
             assert key in record
             assert math.isfinite(float(record[key]))
+
+
+def test_train_mock_subprocess_with_teacher_cache_writes_tmp_only(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "2",
+            "--gradient-accumulation-steps",
+            "1",
+            "--teacher-cache-enabled",
+            "--teacher-cache-dir",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+
+    records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    cache_files = list(tmp_path.glob("*.pt"))
+
+    assert [record["step"] for record in records] == [1, 2]
+    assert cache_files
+    assert all(path.parent == tmp_path for path in cache_files)
+
+
+def test_train_mock_subprocess_topk_uses_full_cached_teacher_logits(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "2",
+            "--gradient-accumulation-steps",
+            "1",
+            "--topk-enabled",
+            "--top-k",
+            "8",
+            "--teacher-cache-enabled",
+            "--teacher-cache-dir",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+
+    records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+
+    assert [record["step"] for record in records] == [1, 2]
+    assert list(tmp_path.glob("*.pt"))
+
+
+def _small_cache_config(tmp_path: Path, *, overwrite: bool = False, use_top_k: bool = False) -> train_module.TrainConfig:
+    config = load_train_config(ROOT / "configs" / "train_config.yaml")
+    return replace(
+        config,
+        gradient_accumulation_steps=1,
+        mixed_precision="no",
+        teacher_cache=LogitCacheConfig(
+            enabled=True,
+            cache_dir=str(tmp_path),
+            dtype="float32",
+            overwrite=overwrite,
+            use_top_k=use_top_k,
+            top_k=4,
+        ),
+        mock=replace(
+            config.mock,
+            batch_size=2,
+            seq_len=8,
+            vocab_size=32,
+            hidden_size=16,
+            num_samples=2,
+            positions_per_sequence=4,
+        ),
+    )
+
+
+def test_train_teacher_cache_computes_once_for_repeated_batch_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _small_cache_config(tmp_path, overwrite=False)
+    teacher = MockTeacherWrapper(config.mock.vocab_size, config.mock.hidden_size)
+    calls = {"count": 0}
+    original_forward = teacher.forward
+
+    def counting_forward(input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        calls["count"] += 1
+        return original_forward(input_ids, attention_mask=attention_mask)
+
+    teacher.forward = counting_forward  # type: ignore[method-assign]
+    monkeypatch.setattr(train_module, "_build_teacher", lambda config, device: teacher.to(device))
+
+    run_training(config, max_steps=2)
+
+    assert calls["count"] == 1
+    assert len(list(tmp_path.glob("*.pt"))) == 1
+
+
+def test_train_teacher_cache_overwrite_recomputes_repeated_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _small_cache_config(tmp_path, overwrite=True)
+    teacher = MockTeacherWrapper(config.mock.vocab_size, config.mock.hidden_size)
+    calls = {"count": 0}
+    original_forward = teacher.forward
+
+    def counting_forward(input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        calls["count"] += 1
+        return original_forward(input_ids, attention_mask=attention_mask)
+
+    teacher.forward = counting_forward  # type: ignore[method-assign]
+    monkeypatch.setattr(train_module, "_build_teacher", lambda config, device: teacher.to(device))
+
+    run_training(config, max_steps=2)
+
+    assert calls["count"] == 2
+    assert len(list(tmp_path.glob("*.pt"))) == 1
+
+
+def test_train_topk_only_teacher_cache_path_raises_not_implemented(tmp_path: Path) -> None:
+    config = _small_cache_config(tmp_path, use_top_k=True)
+
+    with pytest.raises(NotImplementedError, match="Top-k-only teacher logit cache entries"):
+        run_training(config, max_steps=1)
 
 
 def test_mock_training_imports_no_real_llama_or_mamba_modules() -> None:

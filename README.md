@@ -6,7 +6,7 @@ Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
 training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
 teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
 Stage 5C real-HF-teacher smoke training, and Stage 5D top-k KD/CSDM support
-with a mock student:
+with a mock student, plus Stage 5E teacher-cache integration in training:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -38,8 +38,9 @@ shaped `[B, D]` or `[B, T, D]`.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
   shifted labels and `ignore_index` on the final placeholder token.
 - `train.py`: mock training plus an opt-in HuggingFace-teacher/mock-student
-  smoke path with gradient accumulation, CUDA-only autocast, shared
-  valid-position masking, and JSON console metrics.
+  smoke path with gradient accumulation, CUDA-only autocast, optional
+  full-logit teacher caching, shared valid-position masking, and JSON console
+  metrics.
 - `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
 - `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
 - `evals/perturbation_robustness.py`: token-weighted
@@ -95,6 +96,45 @@ Example mock run:
 python train.py --config configs/train_config.yaml --mock --max_steps 2 \
   --topk-enabled --top-k 256
 ```
+
+## Stage 5E Teacher Cache Integration
+
+Training can optionally cache frozen teacher logits for clean token prefixes:
+
+```bash
+python train.py --config configs/train_config.yaml --mock --max_steps 2 \
+  --gradient-accumulation-steps 1 \
+  --teacher-cache-enabled \
+  --teacher-cache-dir /tmp/csdm_teacher_logits
+```
+
+Cache keys are derived from `input_ids`, optional `attention_mask`, and
+teacher-output metadata such as teacher type, teacher implementation, vocab
+size, mock teacher seed, or HuggingFace model identity. They do not include
+labels, student logits, `h_t`, `h'_t`, `h_delta_alt`, `rho`, `sigma`, or
+adapter state. Cache misses call:
+
+```python
+teacher(input_ids, attention_mask=attention_mask)
+```
+
+under `torch.no_grad()`, and cached logits are detached. During training,
+full cached logits are moved to the student logits device before CE/KD/CSDM
+loss computation. If top-k KD/CSDM is enabled, `train.py` still builds selected
+indices from the full cached teacher logits:
+
+```bash
+python train.py --config configs/train_config.yaml --mock --max_steps 2 \
+  --gradient-accumulation-steps 1 \
+  --topk-enabled --top-k 256 \
+  --teacher-cache-enabled \
+  --teacher-cache-dir /tmp/csdm_teacher_logits
+```
+
+`--teacher-cache-overwrite` recomputes matching entries. Top-k-only cache
+storage is available in `TeacherLogitCache`, but `train.py` raises
+`NotImplementedError` for top-k-only cache entries until the cache-to-loss path
+can consume cached `topk_values` and `topk_indices` directly.
 
 ## Stage 5A HuggingFace Teacher Wrapper
 
@@ -179,8 +219,9 @@ python train.py --config configs/train_config.yaml --mock --max_steps 2
 
 ## Stage 5B Teacher Logit Cache
 
-`TeacherLogitCache` is a utility-only scaffold. It is not integrated into
-`train.py` or `evaluate.py`, and mock training does not require cache usage.
+`TeacherLogitCache` stores frozen teacher outputs and is used by `train.py`
+when `teacher_cache.enabled` or `--teacher-cache-enabled` is set. Mock
+training does not require cache usage.
 
 ```python
 from utils.logit_cache import LogitCacheConfig, TeacherLogitCache

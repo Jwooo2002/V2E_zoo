@@ -23,6 +23,7 @@ from losses.kd_loss import build_topk_indices, kd_kl_loss
 from models.cdm_engine import OffTrajectoryConfig
 from models.student_mamba import MockStudentMamba, StudentOutput
 from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper, MockTeacherWrapper
+from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
 
 
@@ -80,6 +81,7 @@ class TrainConfig:
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
     topk: TopKConfig = field(default_factory=TopKConfig)
+    teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     mock: MockConfig = field(default_factory=MockConfig)
     hf_teacher: HuggingFaceRuntimeConfig = field(default_factory=HuggingFaceRuntimeConfig)
@@ -120,6 +122,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Renormalize KD/CSDM distributions over selected vocab entries.",
     )
+    parser.add_argument(
+        "--teacher-cache-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable disk caching for frozen teacher logits on clean token prefixes.",
+    )
+    parser.add_argument("--teacher-cache-dir", type=str, default=None)
+    parser.add_argument(
+        "--teacher-cache-overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Recompute and overwrite teacher cache entries even when a matching key exists.",
+    )
+    parser.add_argument(
+        "--teacher-cache-use-top-k",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Store top-k-only teacher cache entries. Training raises until this loss path is implemented.",
+    )
+    parser.add_argument("--teacher-cache-top-k", type=int, default=None)
     return parser.parse_args()
 
 
@@ -143,6 +165,19 @@ def _optional_str(value: Any) -> str | None:
     return None if value in (None, "") else str(value)
 
 
+def _parse_logit_cache_config(raw: dict[str, Any]) -> LogitCacheConfig:
+    return LogitCacheConfig(
+        enabled=bool(_nested_get(raw, "enabled", LogitCacheConfig.enabled)),
+        cache_dir=str(_nested_get(raw, "cache_dir", LogitCacheConfig.cache_dir)),
+        format=str(_nested_get(raw, "format", LogitCacheConfig.format)),
+        dtype=str(_nested_get(raw, "dtype", LogitCacheConfig.dtype)),
+        device=str(_nested_get(raw, "device", LogitCacheConfig.device)),
+        use_top_k=bool(_nested_get(raw, "use_top_k", LogitCacheConfig.use_top_k)),
+        top_k=int(_nested_get(raw, "top_k", LogitCacheConfig.top_k)),
+        overwrite=bool(_nested_get(raw, "overwrite", LogitCacheConfig.overwrite)),
+    )
+
+
 def load_train_config(path: Path) -> TrainConfig:
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
@@ -152,6 +187,7 @@ def load_train_config(path: Path) -> TrainConfig:
     teacher_raw = raw.get("teacher", {})
     student_raw = raw.get("student", {})
     hf_raw = raw.get("hf_teacher", raw.get("hf_teacher_example", {}))
+    teacher_cache_raw = raw.get("teacher_cache", {}) or {}
     loss = LossConfig(
         ce_weight=float(_nested_get(loss_raw, "ce_weight", LossConfig.ce_weight)),
         kd_weight=float(_nested_get(loss_raw, "kd_weight", LossConfig.kd_weight)),
@@ -207,6 +243,7 @@ def load_train_config(path: Path) -> TrainConfig:
         learning_rate=float(_nested_get(raw, "learning_rate", TrainConfig.learning_rate)),
         max_grad_norm=float(_nested_get(raw, "max_grad_norm", TrainConfig.max_grad_norm)),
         topk=topk,
+        teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
         loss=loss,
         mock=mock,
         hf_teacher=hf_teacher,
@@ -308,6 +345,16 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, topk=replace(config.topk, include_labels=args.topk_include_labels))
     if getattr(args, "topk_renormalize", None) is not None:
         config = replace(config, topk=replace(config.topk, renormalize_topk=args.topk_renormalize))
+    if getattr(args, "teacher_cache_enabled", None) is not None:
+        config = replace(config, teacher_cache=replace(config.teacher_cache, enabled=args.teacher_cache_enabled))
+    if getattr(args, "teacher_cache_dir", None) is not None:
+        config = replace(config, teacher_cache=replace(config.teacher_cache, cache_dir=args.teacher_cache_dir))
+    if getattr(args, "teacher_cache_overwrite", None) is not None:
+        config = replace(config, teacher_cache=replace(config.teacher_cache, overwrite=args.teacher_cache_overwrite))
+    if getattr(args, "teacher_cache_use_top_k", None) is not None:
+        config = replace(config, teacher_cache=replace(config.teacher_cache, use_top_k=args.teacher_cache_use_top_k))
+    if getattr(args, "teacher_cache_top_k", None) is not None:
+        config = replace(config, teacher_cache=replace(config.teacher_cache, top_k=args.teacher_cache_top_k))
     return config
 
 
@@ -508,6 +555,49 @@ def _build_teacher(config: TrainConfig, device: torch.device) -> MockTeacherWrap
     raise ValueError(f"Unsupported teacher_type {config.teacher_type!r}.")
 
 
+def _teacher_cache_extra(config: TrainConfig, teacher_vocab_size: int) -> dict[str, Any]:
+    extra: dict[str, Any] = {
+        "teacher_type": config.teacher_type,
+        "vocab_size": teacher_vocab_size,
+        "teacher_compute_precision": config.mixed_precision,
+        "cache_dtype": config.teacher_cache.dtype,
+    }
+    if config.teacher_type == "mock":
+        extra.update(
+            {
+                "mock_hidden_size": config.mock.hidden_size,
+                "teacher_seed": config.seed,
+                "teacher_impl": "MockTeacherWrapper",
+            }
+        )
+    elif config.teacher_type == "hf":
+        extra.update(
+            {
+                "model_name_or_path": config.hf_teacher.model_name_or_path,
+                "torch_dtype": config.hf_teacher.torch_dtype,
+                "trust_remote_code": config.hf_teacher.trust_remote_code,
+                "attn_implementation": config.hf_teacher.attn_implementation,
+                "use_safetensors": config.hf_teacher.use_safetensors,
+                "load_in_8bit": config.hf_teacher.load_in_8bit,
+                "load_in_4bit": config.hf_teacher.load_in_4bit,
+                "teacher_impl": "HuggingFaceTeacherWrapper",
+            }
+        )
+    return extra
+
+
+def _teacher_logits_from_cache_entry(entry: LogitCacheEntry) -> Tensor:
+    if entry.logits is not None:
+        return entry.logits
+    if entry.topk_values is not None and entry.topk_indices is not None:
+        raise NotImplementedError(
+            "Top-k-only teacher logit cache entries cannot be used by train.py yet. "
+            "Use full-logit cache entries for now, or disable --teacher-cache-use-top-k; "
+            "top-k-only cache-to-loss support is future work."
+        )
+    raise ValueError("Teacher logit cache entry contained neither full logits nor top-k tensors.")
+
+
 def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | None = None) -> None:
     if max_steps <= 0:
         raise ValueError("max_steps must be positive.")
@@ -515,6 +605,12 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         raise ValueError("gradient_accumulation_steps must be positive.")
     if config.student_type != "mock":
         raise ValueError("Only mock student training is implemented.")
+    if config.teacher_cache.enabled and config.teacher_cache.use_top_k:
+        raise NotImplementedError(
+            "Top-k-only teacher logit cache entries cannot be used by train.py yet. "
+            "Use full-logit cache entries for now, or disable --teacher-cache-use-top-k; "
+            "top-k-only cache-to-loss support is future work."
+        )
 
     set_seed(config.seed)
     device = _training_device(config)
@@ -541,6 +637,8 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
     logger = logger if logger is not None else ConsoleLogger()
     autocast_context = _autocast_context(config.mixed_precision, device)
+    teacher_cache = TeacherLogitCache(config.teacher_cache) if config.teacher_cache.enabled else None
+    teacher_cache_extra = _teacher_cache_extra(config, teacher_vocab_size)
 
     for step in range(1, max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -552,7 +650,19 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             labels = batch["labels"].to(device)
             attention_mask = torch.ones_like(input_ids) if config.teacher_type == "hf" else None
             with autocast_context:
-                teacher_logits = teacher(input_ids, attention_mask=attention_mask)
+                if teacher_cache is None:
+                    teacher_logits = teacher(input_ids, attention_mask=attention_mask)
+                else:
+                    entry = teacher_cache.get_or_compute(
+                        input_ids,
+                        compute_fn=lambda clean_input_ids, attention_mask=None: teacher(
+                            clean_input_ids,
+                            attention_mask=attention_mask,
+                        ),
+                        attention_mask=attention_mask,
+                        extra=teacher_cache_extra,
+                    )
+                    teacher_logits = _teacher_logits_from_cache_entry(entry)
                 output = student(input_ids)
                 loss_device = output.on_logits.device
                 teacher_logits = teacher_logits.to(loss_device)
