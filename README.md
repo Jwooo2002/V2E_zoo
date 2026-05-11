@@ -8,8 +8,9 @@ teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
 Stage 5C real-HF-teacher smoke training, Stage 5D top-k KD/CSDM support
 with a mock student, Stage 5E teacher-cache integration in training,
 Stage 6A optional real-Mamba student adapter scaffold, Stage 6B Mamba
-dependency diagnostics, Stage 6C real-Mamba forward smoke support, and Stage
-6D student-side state extraction scaffolding:
+dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
+6D/6E student-side state and approximate off-trajectory scaffolding, and
+Stage 6F opt-in HF-teacher/RealMambaStudent smoke training:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -40,19 +41,19 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
   checks for `mamba_ssm` and `causal-conv1d`.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
-- `scripts/check_mamba_forward.py`: opt-in Stage 6C/6D real-Mamba forward
-  smoke check with tiny config-driven dimensions, state-shape reporting, and
-  no downloads.
+- `scripts/check_mamba_forward.py`: opt-in Stage 6C-6E real-Mamba forward
+  smoke check with tiny config-driven dimensions, state/off-state reporting,
+  and no downloads.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits, plus
   an optional `RealMambaStudent` adapter with lazy `mamba_ssm` import, public
   `MambaLMHeadModel` support, and no private-internal assumptions.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
   shifted labels and `ignore_index` on the final placeholder token.
-- `train.py`: mock training plus an opt-in HuggingFace-teacher/mock-student
-  smoke path with gradient accumulation, CUDA-only autocast, optional
-  full-logit teacher caching, shared valid-position masking, and JSON console
-  metrics.
+- `train.py`: mock training plus opt-in HuggingFace-teacher smoke paths for a
+  mock student or `RealMambaStudent`, with gradient accumulation, CUDA-only
+  autocast, optional full-logit teacher caching, shared valid-position masking,
+  and JSON console metrics.
 - `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
 - `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
 - `evals/perturbation_robustness.py`: token-weighted
@@ -138,11 +139,12 @@ without pinning and validating the pair.
 When `mamba_ssm` is available, `RealMambaStudent` uses the public
 `MambaLMHeadModel` path. The smoke output is a `StudentOutput` with
 `on_logits`, `off_logits`, and detached `fake_logits` shaped `[B, T, V]`.
-For Stage 6C, `off_logits` is an explicit smoke-only placeholder equal to the
-on-trajectory logits, and `fake_logits` is a detached placeholder. This does
-not change CSDM math, teacher behavior, or training behavior. The teacher path
-is unchanged: the teacher consumes only clean `input_ids` and optional
-`attention_mask`, never student recurrent states.
+By default Stage 6E builds an approximate student-side `h_delta_alt`, constructs
+`h_off` with `DeltaPerturbationEngine`, projects `h_off` through the LM head,
+and sets `fake_logits = off_logits.detach()`. This does not change teacher
+behavior or training behavior. The teacher path is unchanged: the teacher
+consumes only clean `input_ids` and optional `attention_mask`, never student
+recurrent states.
 
 ## Stage 6D Real Mamba State Extraction Scaffold
 
@@ -154,11 +156,10 @@ config field `state_extraction` supports:
 - `embedding`: expose token embeddings only as provisional shape plumbing.
 - `none`: expose no state tensors.
 
-`expose_states=false` also suppresses `h`, `h_off`, and `h_delta_alt`. In
-Stage 6D, `h_off` and `h_delta_alt` mirror `h` only as smoke placeholders; real
-delta-controlled `h_delta_alt` extraction and `h'_t` construction remain future
-Stage 6E work. The embedding fallback is not claimed to be the final recurrent
-Mamba state.
+`expose_states=false` suppresses `h`, `h_off`, and `h_delta_alt` in the returned
+`StudentOutput`, but the adapter may still build internal student-side
+off-trajectory tensors when Stage 6E modes are enabled. The embedding fallback
+is not claimed to be the final recurrent Mamba state.
 
 The smoke script reports the state fields explicitly:
 
@@ -175,6 +176,134 @@ python scripts/check_mamba_forward.py \
 
 The JSON output includes `h_shape`, `h_off_shape`, `h_delta_alt_shape`,
 `state_extraction`, and `smoke_placeholder_off_logits`.
+
+## Stage 6E Approximate Real-Mamba Off-State Path
+
+Stage 6E uses the Stage 6D student-side `h` representation to build an
+approximate off-trajectory student representation and `off_logits`. This is not
+true Mamba delta-kernel perturbation or recurrent-state injection. It is a
+scaffold for wiring CSDM-compatible tensors without changing teacher behavior or
+loss math.
+
+Supported `RealMambaStudent` modes:
+
+- `off_state_mode=projection`: build `h_delta_alt` and pass `h, h_delta_alt`
+  through `DeltaPerturbationEngine`.
+- `off_state_mode=placeholder`: mirror `h_delta_alt`, `h_off`, and
+  `off_logits` from the on-trajectory path for smoke only.
+- `off_state_mode=none`: do not build an off-state; real CSDM should not be
+  enabled with this mode.
+- `delta_alt_mode=delta_projection`: approximate drift as
+  `h + eps * tanh(W h)` using a student-side linear layer.
+- `delta_alt_mode=noise`: approximate drift with RMS-scaled Gaussian noise.
+- `delta_alt_mode=identity`: use `h_delta_alt = h`.
+- `off_logits_mode=lm_head`: project `h_off` through the public Mamba LM head.
+- `off_logits_mode=projection_head`: project `h_off` through a dedicated
+  student-side linear head.
+- `off_logits_mode=placeholder`: keep `off_logits == on_logits` for smoke only.
+- `off_state_detach_direction=true`: detach `h_delta_alt - h` before applying
+  sampled `rho`, matching the intended stop-gradient direction.
+
+`fake_logits` are `off_logits.detach()` for now, matching the early
+detached-student placeholder used before an EMA student exists. The teacher
+still consumes only clean token prefixes and never receives `h`, `h_off`,
+`h_delta_alt`, or Mamba states.
+
+Example:
+
+```bash
+python scripts/check_mamba_forward.py \
+  --device cpu \
+  --batch-size 1 \
+  --seq-len 16 \
+  --vocab-size 128 \
+  --hidden-size 64 \
+  --num-layers 2 \
+  --off-state-mode projection \
+  --delta-alt-mode delta_projection \
+  --off-logits-mode lm_head \
+  --off-state-detach-direction
+```
+
+The JSON output reports `off_state_mode`, `delta_alt_mode`, `off_logits_mode`,
+`off_state_detach_direction`, `off_state_source`, `delta_alt_source`,
+`off_logits_source`, `off_state_available`, `delta_alt_available`, and whether
+`smoke_placeholder_off_logits` / `off_logits_placeholder` are active. True
+delta-controlled Mamba-state extraction remains future research and engineering
+work.
+
+## Stage 6F HF Teacher + Real Mamba Smoke Training
+
+Stage 6F enables tiny smoke-scale training with `student_type=mamba`. This is
+not the final experiment-training path. It exists to verify that frozen teacher
+logits, real-Mamba student logits, Stage 6E approximate off-state logits,
+CE/KD/CSDM loss wiring, and gradient accumulation can run together on small
+synthetic token batches.
+
+Tests use fake `transformers` and fake public Mamba modules for the main HF
+teacher + `RealMambaStudent` path, so they do not download weights:
+
+```bash
+pytest -q tests/test_hf_teacher_smoke.py tests/test_train_real_mamba_smoke.py
+```
+
+The optional real-Mamba subprocess smoke in
+`tests/test_train_real_mamba_smoke.py` runs only when `mamba_ssm` is importable;
+otherwise it is skipped.
+
+The mathematical boundary is unchanged:
+
+- the teacher consumes only clean `input_ids` and optional `attention_mask`;
+- the teacher never receives `h`, `h_off`, `h_delta_alt`, or any Mamba state;
+- `on_logits` come from the real Mamba forward path;
+- `off_logits` come from the approximate Stage 6E `h_off` projection/LM-head
+  path;
+- `fake_logits = off_logits.detach()` until an EMA student is added;
+- no direct Llama-Mamba hidden-state MSE is introduced.
+
+Safe mock-teacher + real-Mamba smoke command:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --teacher-type mock \
+  --student-type mamba \
+  --max_steps 1 \
+  --seq-len 16 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --student-vocab-size 128 \
+  --student-hidden-size 64 \
+  --student-num-layers 2 \
+  --mixed-precision no \
+  --csdm-weight 0.03
+```
+
+Manual HF-teacher + real-Mamba smoke command. This can download or require
+local HF files depending on the model path, so it is not used by tests:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --teacher-type hf \
+  --student-type mamba \
+  --teacher-model-name-or-path sshleifer/tiny-gpt2 \
+  --max_steps 1 \
+  --seq-len 16 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --student-hidden-size 64 \
+  --student-num-layers 2 \
+  --mixed-precision no \
+  --csdm-weight 0.03 \
+  --topk-enabled \
+  --top-k 128
+```
+
+For HF teacher smoke training, the real-Mamba student vocab size is aligned to
+the teacher vocab size unless `--student-vocab-size` is explicitly provided.
+If an explicit student vocab override does not match the teacher, training
+raises during teacher/student logit validation.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

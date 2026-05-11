@@ -20,6 +20,13 @@ student:
   local_files_only: false
   delta_perturb_eps: 0.10
   noise_sigma: 0.01
+  use_reference_forward: false
+  state_extraction: last_hidden
+  expose_states: true
+  off_state_mode: projection
+  delta_alt_mode: delta_projection
+  off_logits_mode: lm_head
+  off_state_detach_direction: true
 
 topk:
   enabled: false

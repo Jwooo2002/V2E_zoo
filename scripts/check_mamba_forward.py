@@ -46,6 +46,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable h/h_off/h_delta_alt exposure in the smoke output.",
     )
+    parser.add_argument(
+        "--off-state-mode",
+        choices=("projection", "placeholder", "none"),
+        default="projection",
+        help="Stage 6E student-side off-state approximation mode.",
+    )
+    parser.add_argument(
+        "--delta-alt-mode",
+        choices=("delta_projection", "noise", "identity"),
+        default="delta_projection",
+        help="Stage 6E student-side h_delta_alt approximation mode.",
+    )
+    parser.add_argument(
+        "--off-logits-mode",
+        choices=("lm_head", "projection_head", "placeholder"),
+        default="lm_head",
+        help="Projection used to map h_off to off_logits.",
+    )
+    parser.add_argument(
+        "--off-state-detach-direction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detach h_delta_alt - h before DeltaPerturbationEngine applies rho.",
+    )
     return parser.parse_args()
 
 
@@ -105,7 +129,7 @@ def _compact_error_payload(
             "CUDA fused training work."
         )
     else:
-        payload["probable_cause"] = "Stage 6C real-Mamba smoke could not complete in this environment."
+        payload["probable_cause"] = "Stage 6C-6E real-Mamba smoke could not complete in this environment."
         payload["suggested_action"] = (
             "Run scripts/check_mamba_env.py and retry CPU/reference smoke before real training work."
         )
@@ -123,6 +147,10 @@ def _run_forward(args: argparse.Namespace, device: torch.device, *, use_referenc
         use_reference_forward=use_reference_forward,
         state_extraction=args.state_extraction,
         expose_states=not args.no_expose_states,
+        off_state_mode=args.off_state_mode,
+        delta_alt_mode=args.delta_alt_mode,
+        off_logits_mode=args.off_logits_mode,
+        off_state_detach_direction=args.off_state_detach_direction,
     )
     student = RealMambaStudent(config).eval()
     input_ids = torch.randint(
@@ -134,6 +162,7 @@ def _run_forward(args: argparse.Namespace, device: torch.device, *, use_referenc
     )
     with torch.no_grad():
         output = student(input_ids)
+    metadata = output.metadata or {}
     return {
         "success": True,
         "device": str(device),
@@ -144,9 +173,28 @@ def _run_forward(args: argparse.Namespace, device: torch.device, *, use_referenc
         "h_shape": _shape_or_none(output.h),
         "h_off_shape": _shape_or_none(output.h_off),
         "h_delta_alt_shape": _shape_or_none(output.h_delta_alt),
-        "state_extraction": config.state_extraction,
-        "expose_states": config.expose_states,
-        "smoke_placeholder_off_logits": output.off_logits.data_ptr() == output.on_logits.data_ptr(),
+        "state_extraction": metadata.get("state_extraction", config.state_extraction),
+        "expose_states": metadata.get("expose_states", config.expose_states),
+        "off_state_mode": metadata.get("off_state_mode", config.off_state_mode),
+        "delta_alt_mode": metadata.get("delta_alt_mode", config.delta_alt_mode),
+        "off_logits_mode": metadata.get("off_logits_mode", config.off_logits_mode),
+        "off_state_detach_direction": metadata.get(
+            "off_state_detach_direction",
+            config.off_state_detach_direction,
+        ),
+        "off_logits_source": metadata.get("off_logits_source"),
+        "off_state_source": metadata.get("off_state_source"),
+        "delta_alt_source": metadata.get("delta_alt_source"),
+        "off_state_available": metadata.get("off_state_available"),
+        "delta_alt_available": metadata.get("delta_alt_available"),
+        "off_logits_placeholder": metadata.get(
+            "off_logits_placeholder",
+            output.off_logits.data_ptr() == output.on_logits.data_ptr(),
+        ),
+        "smoke_placeholder_off_logits": metadata.get(
+            "smoke_placeholder_off_logits",
+            output.off_logits.data_ptr() == output.on_logits.data_ptr(),
+        ),
         "dtype": str(output.on_logits.dtype).replace("torch.", ""),
         "mamba_ssm_version": student.mamba_ssm_version,
         "reference_forward": use_reference_forward or device.type == "cpu",

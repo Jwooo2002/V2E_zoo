@@ -23,9 +23,23 @@ class StudentOutput:
     h: Tensor | None
     h_off: Tensor | None
     h_delta_alt: Tensor | None
+    metadata: dict[str, Any] | None = None
 
 
 _STATE_EXTRACTION_MODES = frozenset({"last_hidden", "embedding", "none"})
+_OFF_STATE_MODES = frozenset({"projection", "placeholder", "none"})
+_DELTA_ALT_MODES = frozenset({"delta_projection", "noise", "identity"})
+_OFF_LOGITS_MODES = frozenset({"lm_head", "projection_head", "placeholder"})
+
+
+def _validate_mode(name: str, value: str, allowed_values: frozenset[str]) -> None:
+    if value not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(f"Unsupported {name} {value!r}; expected one of: {allowed}.")
+
+
+def _shape_or_none(tensor: Tensor | None) -> list[int] | None:
+    return None if tensor is None else list(tensor.shape)
 
 
 @dataclass(frozen=True)
@@ -47,14 +61,16 @@ class MambaStudentConfig:
     use_reference_forward: bool = False
     state_extraction: str = "last_hidden"
     expose_states: bool = True
+    off_state_mode: str = "projection"
+    delta_alt_mode: str = "delta_projection"
+    off_logits_mode: str = "lm_head"
+    off_state_detach_direction: bool = True
 
     def __post_init__(self) -> None:
-        if self.state_extraction not in _STATE_EXTRACTION_MODES:
-            allowed = ", ".join(sorted(_STATE_EXTRACTION_MODES))
-            raise ValueError(
-                f"Unsupported state_extraction {self.state_extraction!r}; "
-                f"expected one of: {allowed}."
-            )
+        _validate_mode("state_extraction", self.state_extraction, _STATE_EXTRACTION_MODES)
+        _validate_mode("off_state_mode", self.off_state_mode, _OFF_STATE_MODES)
+        _validate_mode("delta_alt_mode", self.delta_alt_mode, _DELTA_ALT_MODES)
+        _validate_mode("off_logits_mode", self.off_logits_mode, _OFF_LOGITS_MODES)
 
 
 class StudentMamba(nn.Module, ABC):
@@ -115,19 +131,30 @@ class MockStudentMamba(StudentMamba):
             h=h,
             h_off=h_off,
             h_delta_alt=h_delta_alt,
+            metadata={
+                "adapter": "mock",
+                "off_state_mode": "projection",
+                "delta_alt_mode": "delta_projection",
+                "off_logits_mode": "lm_head",
+                "off_state_available": True,
+                "delta_alt_available": True,
+                "smoke_placeholder_off_logits": False,
+                "off_logits_placeholder": False,
+                "fake_logits_detached": not fake_logits.requires_grad,
+            },
         )
 
 
 class RealMambaStudent(StudentMamba):
-    """Opt-in real Mamba student adapter for Stage 6C/6D smoke checks.
+    """Opt-in real Mamba student adapter for Stage 6C-6E smoke checks.
 
     This class imports ``mamba_ssm`` lazily and uses public Mamba classes only.
     Stage 6C verifies tiny model instantiation and logit-shape-compatible
     forward output. Stage 6D exposes a student-side representation ``h`` using
     either the public backbone output or a documented token-embedding fallback
-    for shape plumbing. It does not implement real ``h_delta_alt`` extraction,
-    off-trajectory state construction, or CSDM training with real Mamba.
-    ``off_logits`` mirrors ``on_logits`` as a smoke-only placeholder.
+    for shape plumbing. Stage 6E adds an approximate student-side off-state
+    path. It does not implement true Mamba delta-kernel perturbation or
+    recurrent-state injection; those remain future work.
     """
 
     def __init__(
@@ -137,10 +164,19 @@ class RealMambaStudent(StudentMamba):
     ) -> None:
         super().__init__()
         self.config = config or MambaStudentConfig()
-        self.off_config = off_config or OffTrajectoryConfig(
+        base_off_config = off_config or OffTrajectoryConfig(
             delta_perturb_eps=self.config.delta_perturb_eps,
             noise_sigma=self.config.noise_sigma,
         )
+        self.off_config = OffTrajectoryConfig(
+            delta_perturb_eps=base_off_config.delta_perturb_eps,
+            noise_sigma=base_off_config.noise_sigma,
+            rho_min=base_off_config.rho_min,
+            rho_max=base_off_config.rho_max,
+            detach_direction=self.config.off_state_detach_direction,
+            eps=base_off_config.eps,
+        )
+        self.off_engine = DeltaPerturbationEngine(self.off_config)
         self._device = torch.device(self.config.device) if self.config.device is not None else torch.device("cpu")
         self._dtype = _resolve_torch_dtype(self.config.torch_dtype, self._device)
         try:
@@ -153,6 +189,9 @@ class RealMambaStudent(StudentMamba):
 
         self.model_kind = "MambaLMHeadModel"
         self.model = self._build_lm_head_model()
+        self.delta_projection = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        self.delta_perturb_proj = self.delta_projection
+        self.off_projection_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.to(device=self._device, dtype=self._dtype)
 
     @property
@@ -191,21 +230,35 @@ class RealMambaStudent(StudentMamba):
             )
         _validate_logits(on_logits, input_ids=input_ids, vocab_size=self.config.vocab_size)
 
-        # Stage 6D smoke scaffold only. Real h'_t / h_delta_alt extraction is
-        # intentionally deferred to Stage 6E; h_off and h_delta_alt mirror h
-        # only so downstream shape plumbing can be exercised explicitly.
         h = self._extract_state(input_ids=input_ids, last_hidden=hidden)
-        h_off = h
-        h_delta_alt = h
-        off_logits = on_logits
-        fake_logits = on_logits.detach()
+        h_delta_alt, h_off, off_logits, metadata = self._build_off_trajectory_outputs(
+            h=h,
+            on_logits=on_logits,
+            input_ids=input_ids,
+        )
+        fake_logits = off_logits.detach()
+        exposed_h = h if self.config.expose_states else None
+        exposed_h_off = h_off if self.config.expose_states else None
+        exposed_h_delta_alt = h_delta_alt if self.config.expose_states else None
+        metadata.update(
+            {
+                "state_extraction": self.config.state_extraction,
+                "expose_states": self.config.expose_states,
+                "off_state_detach_direction": self.config.off_state_detach_direction,
+                "fake_logits_detached": not fake_logits.requires_grad,
+                "h_shape": _shape_or_none(exposed_h),
+                "h_off_shape": _shape_or_none(exposed_h_off),
+                "h_delta_alt_shape": _shape_or_none(exposed_h_delta_alt),
+            }
+        )
         return StudentOutput(
             on_logits=on_logits,
             off_logits=off_logits,
             fake_logits=fake_logits,
-            h=h,
-            h_off=h_off,
-            h_delta_alt=h_delta_alt,
+            h=exposed_h,
+            h_off=exposed_h_off,
+            h_delta_alt=exposed_h_delta_alt,
+            metadata=metadata,
         )
 
     def _forward_backbone_logits(
@@ -222,11 +275,12 @@ class RealMambaStudent(StudentMamba):
             hidden = self.model.backbone(input_ids)
             if isinstance(hidden, tuple):
                 hidden = hidden[0]
-            on_logits = self.model.lm_head(hidden)
+            lm_head = getattr(self.model, "lm_head", None)
+            on_logits = self.off_projection_head(hidden) if lm_head is None else lm_head(hidden)
         return hidden, on_logits
 
     def _extract_state(self, *, input_ids: Tensor, last_hidden: Tensor) -> Tensor | None:
-        """Return the Stage 6D student-side state scaffold.
+        """Return the Stage 6D/6E student-side state scaffold.
 
         ``last_hidden`` is the preferred smoke representation because it is the
         public Mamba backbone output used by the LM head. ``embedding`` is a
@@ -234,7 +288,7 @@ class RealMambaStudent(StudentMamba):
         final recurrent Mamba state.
         """
 
-        if not self.config.expose_states or self.config.state_extraction == "none":
+        if self.config.state_extraction == "none":
             return None
         if self.config.state_extraction == "last_hidden":
             return last_hidden
@@ -256,6 +310,129 @@ class RealMambaStudent(StudentMamba):
         if not isinstance(state, Tensor):
             raise RuntimeError("Mamba embedding state extraction did not return a tensor.")
         return state
+
+    def _build_off_trajectory_outputs(
+        self,
+        *,
+        h: Tensor | None,
+        on_logits: Tensor,
+        input_ids: Tensor,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor, dict[str, Any]]:
+        """Build the Stage 6E approximate student-side off-state path."""
+
+        metadata: dict[str, Any] = {
+            "adapter": "real_mamba",
+            "off_state_mode": self.config.off_state_mode,
+            "delta_alt_mode": self.config.delta_alt_mode,
+            "off_logits_mode": self.config.off_logits_mode,
+            "smoke_placeholder_off_logits": False,
+            "off_logits_placeholder": False,
+            "off_logits_source": None,
+            "off_state_source": None,
+            "delta_alt_source": None,
+            "off_state_available": False,
+            "delta_alt_available": False,
+        }
+
+        if h is None:
+            metadata.update(
+                {
+                    "smoke_placeholder_off_logits": True,
+                    "off_logits_placeholder": True,
+                    "off_logits_source": "placeholder_no_state",
+                    "off_state_source": "no_exposed_state",
+                }
+            )
+            return None, None, on_logits, metadata
+
+        if self.config.off_state_mode == "none":
+            metadata.update(
+                {
+                    "smoke_placeholder_off_logits": True,
+                    "off_logits_placeholder": True,
+                    "off_logits_source": "placeholder_no_off_state",
+                    "off_state_source": "none",
+                }
+            )
+            return None, None, on_logits, metadata
+
+        if self.config.off_state_mode == "placeholder":
+            h_delta_alt = h
+            h_off = h
+            metadata.update(
+                {
+                    "smoke_placeholder_off_logits": True,
+                    "off_logits_placeholder": True,
+                    "off_logits_source": "placeholder",
+                    "off_state_source": "placeholder",
+                    "delta_alt_source": "identity",
+                    "off_state_available": True,
+                    "delta_alt_available": True,
+                }
+            )
+            return h_delta_alt, h_off, on_logits, metadata
+        else:
+            self._validate_state_for_off_path(h, input_ids=input_ids)
+            h_delta_alt = self._build_delta_alt(h)
+            h_off = self.off_engine.make_off_state(h, h_delta_alt=h_delta_alt)
+            metadata.update(
+                {
+                    "off_state_source": "delta_perturbation_engine",
+                    "delta_alt_source": self.config.delta_alt_mode,
+                    "off_state_available": True,
+                    "delta_alt_available": True,
+                }
+            )
+
+        if self.config.off_logits_mode == "placeholder":
+            metadata.update(
+                {
+                    "smoke_placeholder_off_logits": True,
+                    "off_logits_placeholder": True,
+                    "off_logits_source": "placeholder",
+                }
+            )
+            return h_delta_alt, h_off, on_logits, metadata
+
+        self._validate_state_for_off_path(h_off, input_ids=input_ids)
+        off_logits, source = self._logits_from_off_state(h_off)
+        _validate_logits(off_logits, input_ids=input_ids, vocab_size=self.config.vocab_size)
+        metadata["off_logits_source"] = source
+        return h_delta_alt, h_off, off_logits, metadata
+
+    def _build_delta_alt(self, h: Tensor) -> Tensor:
+        if self.config.delta_alt_mode == "delta_projection":
+            return h + self.off_config.delta_perturb_eps * torch.tanh(self.delta_projection(h))
+        if self.config.delta_alt_mode == "noise":
+            rms_h = torch.sqrt(h.float().pow(2).mean(dim=-1, keepdim=True) + self.off_config.eps).to(dtype=h.dtype)
+            return h + self.off_config.noise_sigma * rms_h * torch.randn_like(h)
+        if self.config.delta_alt_mode == "identity":
+            return h
+        raise AssertionError(f"Unhandled delta_alt_mode: {self.config.delta_alt_mode!r}")
+
+    def _logits_from_off_state(self, h_off: Tensor) -> tuple[Tensor, str]:
+        if self.config.off_logits_mode == "projection_head":
+            return self.off_projection_head(h_off), "projection_head"
+        if self.config.off_logits_mode == "lm_head":
+            lm_head = getattr(self.model, "lm_head", None)
+            if lm_head is None:
+                return self.off_projection_head(h_off), "projection_head"
+            return lm_head(h_off), "lm_head"
+        raise AssertionError(f"Unhandled off_logits_mode: {self.config.off_logits_mode!r}")
+
+    def _validate_state_for_off_path(self, h: Tensor, *, input_ids: Tensor) -> None:
+        if h.ndim != 3:
+            raise ValueError(f"RealMambaStudent h must have shape [B, T, D], got {tuple(h.shape)}.")
+        if h.shape[:2] != input_ids.shape:
+            raise ValueError(
+                "RealMambaStudent h must match input_ids batch/time dimensions: "
+                f"{tuple(h.shape[:2])} != {tuple(input_ids.shape)}."
+            )
+        if h.shape[-1] != self.config.hidden_size:
+            raise ValueError(
+                "RealMambaStudent h hidden dimension must match config.hidden_size for "
+                f"Stage 6E projection heads: {h.shape[-1]} != {self.config.hidden_size}."
+            )
 
     def _build_lm_head_model(self) -> nn.Module:
         lm_cls = _required_mamba_lm_head_model_class()

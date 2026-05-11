@@ -40,6 +40,9 @@ def test_mock_student_mamba_shapes_and_optional_attention_mask() -> None:
     assert output.h_off.shape == output.h.shape
     assert output.h_delta_alt.shape == output.h.shape
     assert not output.fake_logits.requires_grad
+    assert output.metadata is not None
+    assert output.metadata["off_state_mode"] == "projection"
+    assert output.metadata["fake_logits_detached"] is True
 
 
 def test_mamba_student_config_defaults() -> None:
@@ -59,11 +62,24 @@ def test_mamba_student_config_defaults() -> None:
     assert config.noise_sigma == pytest.approx(0.01)
     assert config.state_extraction == "last_hidden"
     assert config.expose_states is True
+    assert config.off_state_mode == "projection"
+    assert config.delta_alt_mode == "delta_projection"
+    assert config.off_logits_mode == "lm_head"
+    assert config.off_state_detach_direction is True
 
 
-def test_mamba_student_config_invalid_state_extraction_raises() -> None:
-    with pytest.raises(ValueError, match="Unsupported state_extraction"):
-        MambaStudentConfig(state_extraction="private")
+@pytest.mark.parametrize(
+    ("field_name", "kwargs"),
+    [
+        ("state_extraction", {"state_extraction": "private"}),
+        ("off_state_mode", {"off_state_mode": "private"}),
+        ("delta_alt_mode", {"delta_alt_mode": "private"}),
+        ("off_logits_mode", {"off_logits_mode": "private"}),
+    ],
+)
+def test_mamba_student_config_invalid_modes_raise(field_name: str, kwargs: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match=f"Unsupported {field_name}"):
+        MambaStudentConfig(**kwargs)
 
 
 def test_real_mamba_student_missing_dependency_import_error(monkeypatch: pytest.MonkeyPatch) -> None:

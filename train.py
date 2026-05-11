@@ -91,6 +91,7 @@ class TrainConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     mock: MockConfig = field(default_factory=MockConfig)
     mamba_student: MambaStudentConfig = field(default_factory=MambaStudentConfig)
+    student_vocab_size_explicit: bool = False
     hf_teacher: HuggingFaceRuntimeConfig = field(default_factory=HuggingFaceRuntimeConfig)
 
 
@@ -105,6 +106,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-model-name-or-path", default=None)
     parser.add_argument("--student-vocab-size", type=int, default=None)
     parser.add_argument("--student-hidden-size", type=int, default=None)
+    parser.add_argument("--student-num-layers", type=int, default=None)
+    parser.add_argument("--student-state-extraction", choices=("last_hidden", "embedding", "none"), default=None)
+    parser.add_argument("--off-state-mode", choices=("projection", "placeholder", "none"), default=None)
+    parser.add_argument("--delta-alt-mode", choices=("delta_projection", "noise", "identity"), default=None)
+    parser.add_argument("--off-logits-mode", choices=("lm_head", "projection_head", "placeholder"), default=None)
+    parser.add_argument(
+        "--off-state-detach-direction",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Detach h_delta_alt - h before building the real-Mamba smoke off-state.",
+    )
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
@@ -212,6 +224,15 @@ def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
         local_files_only=bool(_nested_get(raw, "local_files_only", MambaStudentConfig.local_files_only)),
         delta_perturb_eps=float(_nested_get(raw, "delta_perturb_eps", MambaStudentConfig.delta_perturb_eps)),
         noise_sigma=float(_nested_get(raw, "noise_sigma", MambaStudentConfig.noise_sigma)),
+        use_reference_forward=bool(_nested_get(raw, "use_reference_forward", MambaStudentConfig.use_reference_forward)),
+        state_extraction=str(_nested_get(raw, "state_extraction", MambaStudentConfig.state_extraction)),
+        expose_states=bool(_nested_get(raw, "expose_states", MambaStudentConfig.expose_states)),
+        off_state_mode=str(_nested_get(raw, "off_state_mode", MambaStudentConfig.off_state_mode)),
+        delta_alt_mode=str(_nested_get(raw, "delta_alt_mode", MambaStudentConfig.delta_alt_mode)),
+        off_logits_mode=str(_nested_get(raw, "off_logits_mode", MambaStudentConfig.off_logits_mode)),
+        off_state_detach_direction=bool(
+            _nested_get(raw, "off_state_detach_direction", MambaStudentConfig.off_state_detach_direction)
+        ),
     )
 
 
@@ -378,6 +399,13 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             local_files_only=config.mamba_student.local_files_only or model_student.local_files_only,
             delta_perturb_eps=config.mamba_student.delta_perturb_eps,
             noise_sigma=config.mamba_student.noise_sigma,
+            use_reference_forward=config.mamba_student.use_reference_forward or model_student.use_reference_forward,
+            state_extraction=config.mamba_student.state_extraction or model_student.state_extraction,
+            expose_states=config.mamba_student.expose_states,
+            off_state_mode=config.mamba_student.off_state_mode or model_student.off_state_mode,
+            delta_alt_mode=config.mamba_student.delta_alt_mode or model_student.delta_alt_mode,
+            off_logits_mode=config.mamba_student.off_logits_mode or model_student.off_logits_mode,
+            off_state_detach_direction=config.mamba_student.off_state_detach_direction,
         ),
     )
 
@@ -396,9 +424,34 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             mamba_student=replace(config.mamba_student, model_name_or_path=args.student_model_name_or_path),
         )
     if getattr(args, "student_vocab_size", None) is not None:
-        config = replace(config, mamba_student=replace(config.mamba_student, vocab_size=args.student_vocab_size))
+        config = replace(
+            config,
+            mamba_student=replace(config.mamba_student, vocab_size=args.student_vocab_size),
+            student_vocab_size_explicit=True,
+        )
     if getattr(args, "student_hidden_size", None) is not None:
         config = replace(config, mamba_student=replace(config.mamba_student, hidden_size=args.student_hidden_size))
+    if getattr(args, "student_num_layers", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, num_layers=args.student_num_layers))
+    if getattr(args, "student_state_extraction", None) is not None:
+        config = replace(
+            config,
+            mamba_student=replace(config.mamba_student, state_extraction=args.student_state_extraction),
+        )
+    if getattr(args, "off_state_mode", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, off_state_mode=args.off_state_mode))
+    if getattr(args, "delta_alt_mode", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, delta_alt_mode=args.delta_alt_mode))
+    if getattr(args, "off_logits_mode", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, off_logits_mode=args.off_logits_mode))
+    if getattr(args, "off_state_detach_direction", None) is not None:
+        config = replace(
+            config,
+            mamba_student=replace(
+                config.mamba_student,
+                off_state_detach_direction=args.off_state_detach_direction,
+            ),
+        )
     if args.local_files_only:
         config = replace(
             config,
@@ -437,6 +490,8 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, teacher_cache=replace(config.teacher_cache, use_top_k=args.teacher_cache_use_top_k))
     if getattr(args, "teacher_cache_top_k", None) is not None:
         config = replace(config, teacher_cache=replace(config.teacher_cache, top_k=args.teacher_cache_top_k))
+    if config.student_type == "mamba" and config.teacher_type == "mock":
+        config = replace(config, mock=replace(config.mock, vocab_size=config.mamba_student.vocab_size))
     return config
 
 
@@ -645,18 +700,45 @@ def _build_student(config: TrainConfig, teacher_vocab_size: int, device: torch.d
             off_config=OffTrajectoryConfig(),
         ).to(device)
     if config.student_type == "mamba":
-        student_config = config.mamba_student
+        student_vocab_size = config.mamba_student.vocab_size
+        if not config.student_vocab_size_explicit:
+            student_vocab_size = teacher_vocab_size
+        student_config = replace(
+            config.mamba_student,
+            vocab_size=student_vocab_size,
+            device=config.mamba_student.device or str(device),
+        )
         student = RealMambaStudent(
             student_config,
             off_config=OffTrajectoryConfig(
                 delta_perturb_eps=student_config.delta_perturb_eps,
                 noise_sigma=student_config.noise_sigma,
+                detach_direction=student_config.off_state_detach_direction,
             ),
         )
-        if student_config.device is not None:
-            return student.to(torch.device(student_config.device))
-        return student.to(device)
+        return student.to(torch.device(student_config.device or str(device)))
     raise ValueError(f"Unsupported student_type {config.student_type!r}.")
+
+
+def _effective_student_vocab_size(config: TrainConfig, teacher_vocab_size: int) -> int:
+    if config.student_type == "mock":
+        return teacher_vocab_size
+    if config.student_type == "mamba":
+        if not config.student_vocab_size_explicit:
+            return teacher_vocab_size
+        return config.mamba_student.vocab_size
+    raise ValueError(f"Unsupported student_type {config.student_type!r}.")
+
+
+def _validate_teacher_student_vocab(config: TrainConfig, teacher_vocab_size: int) -> None:
+    student_vocab_size = _effective_student_vocab_size(config, teacher_vocab_size)
+    if student_vocab_size != teacher_vocab_size:
+        raise ValueError(
+            "teacher and student vocab sizes must match for smoke training before token generation: "
+            f"teacher={teacher_vocab_size}, student={student_vocab_size}. "
+            "For HF teacher + RealMambaStudent smoke, omit --student-vocab-size to align to the "
+            "teacher automatically, or provide an explicit matching value."
+        )
 
 
 def _teacher_cache_extra(config: TrainConfig, teacher_vocab_size: int) -> dict[str, Any]:
@@ -713,12 +795,22 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             "Use full-logit cache entries for now, or disable --teacher-cache-use-top-k; "
             "top-k-only cache-to-loss support is future work."
         )
-    if config.student_type == "mamba":
-        raise NotImplementedError(
-            "RealMambaStudent training is not implemented yet. Stage 6C only supports "
-            "import/instantiate/forward smoke via scripts/check_mamba_forward.py; "
-            "real hidden-state extraction, delta perturbation, and logits_from_state "
-            "wiring are future Stage 6D/6E work."
+    if (
+        config.student_type == "mamba"
+        and config.loss.csdm_weight > 0
+        and (
+            config.mamba_student.off_state_mode == "placeholder"
+            or config.mamba_student.off_state_mode == "none"
+            or config.mamba_student.off_logits_mode == "placeholder"
+            or config.mamba_student.state_extraction == "none"
+            or config.mamba_student.delta_alt_mode != "delta_projection"
+        )
+    ):
+        raise ValueError(
+            "RealMambaStudent CSDM smoke training requires an exposed approximate off-state path. "
+            "Use --student-state-extraction last_hidden, --off-state-mode projection, "
+            "--delta-alt-mode delta_projection, and a non-placeholder --off-logits-mode, "
+            "or set --csdm-weight 0.0."
         )
 
     set_seed(config.seed)
@@ -727,6 +819,7 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     teacher_vocab_size = _teacher_vocab_size(teacher)
     if teacher_vocab_size <= 1:
         raise ValueError(f"teacher vocab_size must be greater than 1, got {teacher_vocab_size}.")
+    _validate_teacher_student_vocab(config, teacher_vocab_size)
 
     dataset = MockTextDataset(
         vocab_size=teacher_vocab_size,
