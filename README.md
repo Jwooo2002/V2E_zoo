@@ -99,6 +99,14 @@ explicit cached/top-k teacher-logit path that maps indices correctly. The mock
 teacher remains the runnable default in `configs/model_config.yaml`; the
 `hf_teacher_example` block is documentation for future real-model runs.
 
+By default the HF teacher asks Transformers to load safetensors weights
+(`use_safetensors=True`). If a legacy model only ships PyTorch `.bin`
+checkpoints, prefer a safetensors variant of the model. Set
+`use_safetensors: false` only when the model source is trusted and the runtime
+uses `torch>=2.6`, or upgrade to `torch>=2.6` if Transformers reports the
+`torch.load` checkpoint vulnerability error. Do not patch Transformers
+internals to bypass that safety check.
+
 ## Stage 5C HuggingFace Teacher Smoke Training
 
 The real teacher smoke path keeps the student mocked and does not implement

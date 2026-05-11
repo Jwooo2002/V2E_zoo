@@ -66,6 +66,7 @@ class HuggingFaceTeacherConfig:
     trust_remote_code: bool = False
     attn_implementation: str | None = None
     local_files_only: bool = False
+    use_safetensors: bool = True
     load_in_8bit: bool = False
     load_in_4bit: bool = False
 
@@ -102,6 +103,22 @@ def _load_transformers_classes() -> tuple[Any, Any]:
     return AutoModelForCausalLM, AutoTokenizer
 
 
+def _looks_like_missing_safetensors(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "safetensor" not in message:
+        return False
+    missing_markers = (
+        "no file",
+        "not found",
+        "does not appear",
+        "doesn't appear",
+        "missing",
+        "cannot find",
+        "could not find",
+    )
+    return any(marker in message for marker in missing_markers)
+
+
 class HuggingFaceTeacherWrapper(TeacherWrapper):
     """Frozen HuggingFace causal-LM teacher over clean token prefixes only."""
 
@@ -122,6 +139,7 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
             "device_map": config.device_map,
             "trust_remote_code": config.trust_remote_code,
             "local_files_only": config.local_files_only,
+            "use_safetensors": config.use_safetensors,
         }
         if config.load_in_8bit:
             model_kwargs["load_in_8bit"] = True
@@ -134,6 +152,14 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
             self.tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path, **tokenizer_kwargs)
             self.model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path, **model_kwargs)
         except Exception as exc:
+            if config.use_safetensors and _looks_like_missing_safetensors(exc):
+                raise RuntimeError(
+                    "Failed to load HuggingFace teacher with use_safetensors=True because "
+                    f"{config.model_name_or_path!r} does not appear to provide safetensors weights. "
+                    "Try a model with safetensors; set use_safetensors=false only if torch>=2.6 "
+                    "and the model source is trusted, or upgrade to torch>=2.6 before loading "
+                    "legacy PyTorch checkpoints."
+                ) from exc
             raise RuntimeError(
                 "Failed to load HuggingFace teacher model/tokenizer from "
                 f"{config.model_name_or_path!r}. Check authentication, local_files_only, "

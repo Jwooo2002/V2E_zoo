@@ -57,6 +57,7 @@ class HuggingFaceRuntimeConfig:
     trust_remote_code: bool = False
     attn_implementation: str | None = None
     local_files_only: bool = False
+    use_safetensors: bool = True
     load_in_8bit: bool = False
     load_in_4bit: bool = False
 
@@ -156,6 +157,7 @@ def load_train_config(path: Path) -> TrainConfig:
             hf_raw.get("attn_implementation", HuggingFaceRuntimeConfig.attn_implementation)
         ),
         local_files_only=bool(hf_raw.get("local_files_only", HuggingFaceRuntimeConfig.local_files_only)),
+        use_safetensors=bool(hf_raw.get("use_safetensors", HuggingFaceRuntimeConfig.use_safetensors)),
         load_in_8bit=bool(hf_raw.get("load_in_8bit", HuggingFaceRuntimeConfig.load_in_8bit)),
         load_in_4bit=bool(hf_raw.get("load_in_4bit", HuggingFaceRuntimeConfig.load_in_4bit)),
     )
@@ -194,6 +196,7 @@ def _load_model_config_hf_defaults(config_path: Path) -> HuggingFaceRuntimeConfi
             hf_raw.get("attn_implementation", HuggingFaceRuntimeConfig.attn_implementation)
         ),
         local_files_only=bool(hf_raw.get("local_files_only", HuggingFaceRuntimeConfig.local_files_only)),
+        use_safetensors=bool(hf_raw.get("use_safetensors", HuggingFaceRuntimeConfig.use_safetensors)),
         load_in_8bit=bool(hf_raw.get("load_in_8bit", HuggingFaceRuntimeConfig.load_in_8bit)),
         load_in_4bit=bool(hf_raw.get("load_in_4bit", HuggingFaceRuntimeConfig.load_in_4bit)),
     )
@@ -225,6 +228,7 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             trust_remote_code=config.hf_teacher.trust_remote_code or model_hf.trust_remote_code,
             attn_implementation=config.hf_teacher.attn_implementation or model_hf.attn_implementation,
             local_files_only=config.hf_teacher.local_files_only or model_hf.local_files_only,
+            use_safetensors=config.hf_teacher.use_safetensors,
             load_in_8bit=config.hf_teacher.load_in_8bit or model_hf.load_in_8bit,
             load_in_4bit=config.hf_teacher.load_in_4bit or model_hf.load_in_4bit,
         )
@@ -441,6 +445,7 @@ def _build_teacher(config: TrainConfig, device: torch.device) -> MockTeacherWrap
                 trust_remote_code=config.hf_teacher.trust_remote_code,
                 attn_implementation=config.hf_teacher.attn_implementation,
                 local_files_only=config.hf_teacher.local_files_only,
+                use_safetensors=config.hf_teacher.use_safetensors,
                 load_in_8bit=config.hf_teacher.load_in_8bit,
                 load_in_4bit=config.hf_teacher.load_in_4bit,
             )

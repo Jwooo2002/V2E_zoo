@@ -153,6 +153,12 @@ def test_hf_wrapper_import_error_is_informative(monkeypatch: pytest.MonkeyPatch)
         HuggingFaceTeacherWrapper(HuggingFaceTeacherConfig(model_name_or_path="local-test-model"))
 
 
+def test_hf_teacher_config_prefers_safetensors_by_default() -> None:
+    config = HuggingFaceTeacherConfig(model_name_or_path="tiny-local-model")
+
+    assert config.use_safetensors is True
+
+
 def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -180,6 +186,7 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
         "device_map": "cuda",
         "trust_remote_code": True,
         "local_files_only": True,
+        "use_safetensors": True,
         "load_in_8bit": True,
         "attn_implementation": "flash_attention_2",
     }
@@ -209,8 +216,26 @@ def test_hf_wrapper_omits_non_quantized_kwargs(monkeypatch: pytest.MonkeyPatch) 
     HuggingFaceTeacherWrapper(config)
 
     _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert model_kwargs["use_safetensors"] is True
     assert "load_in_8bit" not in model_kwargs
     assert "load_in_4bit" not in model_kwargs
+
+
+def test_hf_wrapper_passes_use_safetensors_false_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _, _ = _install_fake_transformers(monkeypatch)
+
+    config = HuggingFaceTeacherConfig(
+        model_name_or_path="legacy-local-model",
+        torch_dtype="float32",
+        device_map="cpu",
+        use_safetensors=False,
+    )
+    HuggingFaceTeacherWrapper(config)
+
+    _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert model_kwargs["use_safetensors"] is False
 
 
 def test_hf_wrapper_passes_8bit_quantization_when_enabled(
@@ -227,6 +252,7 @@ def test_hf_wrapper_passes_8bit_quantization_when_enabled(
     HuggingFaceTeacherWrapper(config)
 
     _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert model_kwargs["use_safetensors"] is True
     assert model_kwargs["load_in_8bit"] is True
     assert "load_in_4bit" not in model_kwargs
 
@@ -245,6 +271,7 @@ def test_hf_wrapper_passes_4bit_quantization_when_enabled(
     HuggingFaceTeacherWrapper(config)
 
     _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert model_kwargs["use_safetensors"] is True
     assert "load_in_8bit" not in model_kwargs
     assert model_kwargs["load_in_4bit"] is True
 
@@ -285,3 +312,33 @@ def test_hf_wrapper_wraps_loading_failures(monkeypatch: pytest.MonkeyPatch) -> N
     config = replace(HuggingFaceTeacherConfig(model_name_or_path="gated-model"), local_files_only=True)
     with pytest.raises(RuntimeError, match="Failed to load HuggingFace teacher"):
         HuggingFaceTeacherWrapper(config)
+
+
+def test_hf_wrapper_missing_safetensors_failure_explains_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_transformers = types.ModuleType("transformers")
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args: object, **_kwargs: object) -> "FakeTokenizer":
+            return cls()
+
+    class FailingModel:
+        @classmethod
+        def from_pretrained(cls, *_args: object, **_kwargs: object) -> object:
+            raise OSError("Error no file named model.safetensors found in directory")
+
+    fake_transformers.AutoModelForCausalLM = FailingModel
+    fake_transformers.AutoTokenizer = FakeTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    config = HuggingFaceTeacherConfig(model_name_or_path="legacy-model")
+    with pytest.raises(RuntimeError) as exc_info:
+        HuggingFaceTeacherWrapper(config)
+
+    message = str(exc_info.value)
+    assert "use_safetensors=True" in message
+    assert "Try a model with safetensors" in message
+    assert "set use_safetensors=false only if torch>=2.6" in message
+    assert "upgrade to torch>=2.6" in message
