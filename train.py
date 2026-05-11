@@ -713,6 +713,13 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             "Use full-logit cache entries for now, or disable --teacher-cache-use-top-k; "
             "top-k-only cache-to-loss support is future work."
         )
+    if config.student_type == "mamba":
+        raise NotImplementedError(
+            "RealMambaStudent training is not implemented yet. Stage 6C only supports "
+            "import/instantiate/forward smoke via scripts/check_mamba_forward.py; "
+            "real hidden-state extraction, delta perturbation, and logits_from_state "
+            "wiring are future Stage 6D/6E work."
+        )
 
     set_seed(config.seed)
     device = _training_device(config)
@@ -732,12 +739,6 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     batches = infinite_loader(loader)
 
     student = _build_student(config, teacher_vocab_size, device)
-    if config.student_type == "mamba":
-        raise NotImplementedError(
-            "RealMambaStudent training is a Stage 6A scaffold only. The real "
-            "student forward path for hidden-state extraction, delta "
-            "perturbation, and logits_from_state is future Stage 6B/6C work."
-        )
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
     logger = logger if logger is not None else ConsoleLogger()
     autocast_context = _autocast_context(config.mixed_precision, device)

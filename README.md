@@ -7,8 +7,8 @@ training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
 teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
 Stage 5C real-HF-teacher smoke training, Stage 5D top-k KD/CSDM support
 with a mock student, Stage 5E teacher-cache integration in training,
-Stage 6A optional real-Mamba student adapter scaffold, and Stage 6B Mamba
-dependency diagnostics:
+Stage 6A optional real-Mamba student adapter scaffold, Stage 6B Mamba
+dependency diagnostics, and Stage 6C real-Mamba forward smoke support:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -39,10 +39,12 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
   checks for `mamba_ssm` and `causal-conv1d`.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
+- `scripts/check_mamba_forward.py`: opt-in Stage 6C real-Mamba forward smoke
+  check with tiny config-driven dimensions and no downloads.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits, plus
-  an optional `RealMambaStudent` Stage 6A scaffold with lazy `mamba_ssm`
-  import and no private-internal assumptions.
+  an optional `RealMambaStudent` adapter with lazy `mamba_ssm` import, public
+  `MambaLMHeadModel` support, and no private-internal assumptions.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
   shifted labels and `ignore_index` on the final placeholder token.
 - `train.py`: mock training plus an opt-in HuggingFace-teacher/mock-student
@@ -86,34 +88,43 @@ surrogate used to exercise the off-trajectory engine; it is not real Mamba
 delta behavior. Fake logits are detached at the producer boundary before being
 passed to `csdm_loss`.
 
-## Stage 6A Real Mamba Student Adapter Scaffold
+## Stage 6C Real Mamba Forward Smoke
 
-`RealMambaStudent` is an opt-in scaffold for future real Mamba experiments.
-It does not import `mamba_ssm` at module import time, so mock tests and mock
-training remain dependency-free:
+`RealMambaStudent` is opt-in and still does not import `mamba_ssm` at module
+import time, so mock tests and mock training remain dependency-free:
 
 ```bash
 python -m compileall .
-pytest -q tests/test_mamba_adapter.py tests/test_train_smoke.py
+pytest -q tests/test_mamba_adapter.py tests/test_real_mamba_smoke.py tests/test_train_smoke.py
 ```
 
-Selecting the real Mamba student requires `mamba-ssm` only at instantiation:
+Run the real forward smoke explicitly:
 
 ```bash
-python train.py --config configs/train_config.yaml \
-  --student-type mamba \
-  --student-model-name-or-path /path/to/local/mamba \
-  --local-files-only \
-  --max_steps 1
+python scripts/check_mamba_forward.py \
+  --device cuda \
+  --batch-size 1 \
+  --seq-len 16 \
+  --vocab-size 128 \
+  --hidden-size 64 \
+  --num-layers 2
 ```
 
-Stage 6A intentionally raises a clear `ImportError` if `mamba-ssm` is missing.
-If the dependency is present, `RealMambaStudent.forward` raises
-`NotImplementedError` because real Mamba hidden-state extraction,
-delta-controlled transition perturbation, and `logits_from_state` wiring remain
-future work. The teacher path is unchanged: the teacher consumes
-only clean `input_ids` and optional `attention_mask`, never student recurrent
-states.
+Use `--device cpu` for environments without visible CUDA. Some `mamba-ssm`
+builds expose CUDA-only fast paths; the Stage 6C adapter switches to public
+reference paths for CPU smoke when available, and otherwise the script exits
+nonzero with a JSON error.
+
+When `mamba_ssm` is available, `RealMambaStudent` uses the public
+`MambaLMHeadModel` path. The smoke output is a `StudentOutput` with
+`on_logits`, `off_logits`, and detached `fake_logits` shaped `[B, T, V]`.
+For Stage 6C, `off_logits` and `h_off` are explicit smoke-only placeholders
+equal to the on-trajectory outputs, and `fake_logits` is a detached
+placeholder. This does not change CSDM math, teacher behavior, or training
+behavior. Real `h_t`, `h'_t`, `h_delta_alt`, and delta-controlled
+off-trajectory state construction remain Stage 6D/6E work. The teacher path is
+unchanged: the teacher consumes only clean `input_ids` and optional
+`attention_mask`, never student recurrent states.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

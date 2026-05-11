@@ -24,9 +24,10 @@ student:
   delta_perturb_eps: 0.10
   noise_sigma: 0.01
   notes:
-    - Real Mamba is an optional Stage 6A scaffold.
+    - Real Mamba is optional and used only by explicit smoke checks unless selected in future training work.
     - Mock training and tests do not require mamba-ssm.
-    - Hidden-state extraction and delta perturbation are future Stage 6B/6C work.
+    - Stage 6C real forward smoke uses public MambaLMHeadModel when available.
+    - Stage 6C off_logits and fake_logits are smoke-only placeholders; real h_delta_alt/off-state CSDM construction remains future Stage 6D/6E work.
 
 hf_teacher_example:
   enabled: false
@@ -45,7 +46,7 @@ hf_teacher_example:
     - Set local_files_only true when using a pre-downloaded local cache/path.
     - Real KD requires compatible token indices or cached/top-k teacher logits.
 
-stage: 6A
+stage: 6C
 real_model_imports: opt_in_hf_teacher_and_real_mamba_student_only
 hf_teacher_smoke_training:
   enabled_by_cli: true

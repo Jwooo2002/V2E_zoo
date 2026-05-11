@@ -73,18 +73,25 @@ def test_real_mamba_student_missing_dependency_import_error(monkeypatch: pytest.
         RealMambaStudent()
 
 
-def test_real_mamba_student_fake_dependency_forward_not_implemented(
+def test_real_mamba_student_fake_dependency_without_public_model_not_implemented(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    real_import_module = importlib.import_module
     fake_mamba = types.ModuleType("mamba_ssm")
+
+    def fake_import_module(name: str, package: str | None = None) -> types.ModuleType:
+        if name == "mamba_ssm":
+            return fake_mamba
+        if name.startswith("mamba_ssm."):
+            raise ImportError(f"missing public mamba module {name}")
+        return real_import_module(name, package)
+
     monkeypatch.setattr(
         "models.student_mamba.importlib.import_module",
-        lambda name, package=None: fake_mamba if name == "mamba_ssm" else importlib.import_module(name, package),
+        fake_import_module,
     )
-    student = RealMambaStudent(MambaStudentConfig(vocab_size=17, hidden_size=8))
-
-    with pytest.raises(NotImplementedError, match="Stage 6A scaffold"):
-        student(torch.randint(0, 17, (2, 5)))
+    with pytest.raises(NotImplementedError, match="MambaLMHeadModel"):
+        RealMambaStudent(MambaStudentConfig(vocab_size=17, hidden_size=8))
 
 
 def test_train_mock_path_does_not_instantiate_real_mamba(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,10 +153,19 @@ def test_cli_student_type_mamba_parses_without_downloads(monkeypatch: pytest.Mon
 def test_train_mamba_path_with_fake_dependency_raises_clear_not_implemented(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    real_import_module = importlib.import_module
     fake_mamba = types.ModuleType("mamba_ssm")
+
+    def fake_import_module(name: str, package: str | None = None) -> types.ModuleType:
+        if name == "mamba_ssm":
+            return fake_mamba
+        if name.startswith("mamba_ssm."):
+            raise ImportError(f"missing public mamba module {name}")
+        return real_import_module(name, package)
+
     monkeypatch.setattr(
         "models.student_mamba.importlib.import_module",
-        lambda name, package=None: fake_mamba if name == "mamba_ssm" else importlib.import_module(name, package),
+        fake_import_module,
     )
     config = replace(
         train.load_train_config(ROOT / "configs" / "train_config.yaml"),
@@ -167,7 +183,7 @@ def test_train_mamba_path_with_fake_dependency_raises_clear_not_implemented(
         ),
     )
 
-    with pytest.raises(NotImplementedError, match="RealMambaStudent training is a Stage 6A scaffold"):
+    with pytest.raises((ImportError, NotImplementedError), match="RealMambaStudent|MambaLMHeadModel|mamba"):
         train.run_training(config, max_steps=1)
 
 

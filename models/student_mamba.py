@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from contextlib import contextmanager
 import importlib
 from types import ModuleType
+from typing import Any, Iterator
 
 import torch
 from torch import Tensor, nn
@@ -103,11 +105,13 @@ class MockStudentMamba(StudentMamba):
 
 
 class RealMambaStudent(StudentMamba):
-    """Opt-in real Mamba student adapter placeholder for Stage 6A.
+    """Opt-in real Mamba student adapter for Stage 6C forward smoke.
 
-    This class intentionally imports ``mamba_ssm`` lazily and does not touch
-    private Mamba internals. Real hidden-state extraction, delta perturbation,
-    and logits-from-state wiring are future Stage 6B/6C work.
+    This class imports ``mamba_ssm`` lazily and uses public Mamba classes only.
+    Stage 6C verifies tiny model instantiation and logit-shape-compatible
+    forward output. It does not implement real ``h_delta_alt`` extraction,
+    off-trajectory state construction, or CSDM training with real Mamba.
+    ``off_logits`` mirrors ``on_logits`` as a smoke-only placeholder.
     """
 
     def __init__(
@@ -121,6 +125,8 @@ class RealMambaStudent(StudentMamba):
             delta_perturb_eps=self.config.delta_perturb_eps,
             noise_sigma=self.config.noise_sigma,
         )
+        self._device = torch.device(self.config.device) if self.config.device is not None else torch.device("cpu")
+        self._dtype = _resolve_torch_dtype(self.config.torch_dtype, self._device)
         try:
             self.mamba_ssm: ModuleType = importlib.import_module("mamba_ssm")
         except ImportError as exc:
@@ -129,10 +135,182 @@ class RealMambaStudent(StudentMamba):
                 "Install it only when running real Mamba experiments."
             ) from exc
 
+        self.model_kind = "MambaLMHeadModel"
+        self.model = self._build_lm_head_model()
+        self.to(device=self._device, dtype=self._dtype)
+
+    @property
+    def vocab_size(self) -> int:
+        return self.config.vocab_size
+
+    @property
+    def mamba_ssm_version(self) -> str | None:
+        version = getattr(self.mamba_ssm, "__version__", None)
+        return str(version) if version is not None else None
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> StudentOutput:
-        del input_ids, attention_mask
-        raise NotImplementedError(
-            "RealMambaStudent forward is a Stage 6A scaffold only. Real Mamba "
-            "hidden-state extraction, delta perturbation, and logits_from_state "
-            "wiring are future Stage 6B/6C work."
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}.")
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "attention_mask must have the same shape as input_ids, "
+                f"got {tuple(attention_mask.shape)} and {tuple(input_ids.shape)}."
+            )
+        del attention_mask
+
+        input_ids = input_ids.to(self._device)
+        with _mamba_cpu_reference_kernel_patch(self._device.type == "cpu"):
+            hidden = self.model.backbone(input_ids)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+            on_logits = self.model.lm_head(hidden)
+        _validate_logits(on_logits, input_ids=input_ids, vocab_size=self.config.vocab_size)
+
+        # Stage 6C smoke placeholder only. Real h'_t / h_delta_alt extraction is
+        # intentionally deferred to Stage 6D/6E.
+        h = hidden
+        h_off = hidden
+        h_delta_alt = hidden
+        off_logits = on_logits
+        fake_logits = on_logits.detach()
+        return StudentOutput(
+            on_logits=on_logits,
+            off_logits=off_logits,
+            fake_logits=fake_logits,
+            h=h,
+            h_off=h_off,
+            h_delta_alt=h_delta_alt,
         )
+
+    def _build_lm_head_model(self) -> nn.Module:
+        lm_cls = _required_mamba_lm_head_model_class()
+        if self.config.use_pretrained:
+            if self.config.model_name_or_path is None:
+                raise ValueError("model_name_or_path is required when use_pretrained=True.")
+            if not hasattr(lm_cls, "from_pretrained"):
+                raise NotImplementedError(
+                    "RealMambaStudent pretrained loading requires public "
+                    "MambaLMHeadModel.from_pretrained."
+                )
+            kwargs: dict[str, Any] = {"device": str(self._device), "dtype": self._dtype}
+            if self.config.local_files_only:
+                kwargs["local_files_only"] = True
+            try:
+                return lm_cls.from_pretrained(self.config.model_name_or_path, **kwargs)
+            except TypeError as exc:
+                if self.config.local_files_only:
+                    raise RuntimeError(
+                        "RealMambaStudent local_files_only=True could not be passed to "
+                        "MambaLMHeadModel.from_pretrained. Refusing to retry without it."
+                    ) from exc
+                kwargs.pop("local_files_only", None)
+                return lm_cls.from_pretrained(self.config.model_name_or_path, **kwargs)
+
+        config_cls = _required_mamba_config_class()
+        mamba_config = _instantiate_mamba_config(config_cls, self.config, self._device)
+        return lm_cls(mamba_config, device=str(self._device), dtype=self._dtype)
+
+
+def _resolve_torch_dtype(torch_dtype: str, device: torch.device) -> torch.dtype:
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    try:
+        dtype = dtype_map[torch_dtype]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(dtype_map))
+        raise ValueError(f"Unsupported torch_dtype {torch_dtype!r}; expected one of: {allowed}.") from exc
+    if device.type == "cpu" and dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return dtype
+
+
+def _required_mamba_lm_head_model_class() -> type[nn.Module]:
+    candidates = (
+        ("mamba_ssm.models.mixer_seq_simple", "MambaLMHeadModel"),
+        ("mamba_ssm", "MambaLMHeadModel"),
+    )
+    for module_name, class_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        cls = getattr(module, class_name, None)
+        if cls is not None:
+            return cls
+    raise NotImplementedError(
+        "RealMambaStudent requires public MambaLMHeadModel from mamba_ssm for Stage 6C smoke."
+    )
+
+
+def _required_mamba_config_class() -> type[Any]:
+    candidates = (
+        ("mamba_ssm.models.config_mamba", "MambaConfig"),
+        ("mamba_ssm.models.mixer_seq_simple", "MambaConfig"),
+        ("mamba_ssm", "MambaConfig"),
+    )
+    for module_name, class_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        cls = getattr(module, class_name, None)
+        if cls is not None:
+            return cls
+    raise NotImplementedError("RealMambaStudent requires public MambaConfig from mamba_ssm.")
+
+
+def _instantiate_mamba_config(config_cls: type[Any], config: MambaStudentConfig, device: torch.device) -> Any:
+    n_layer = config.num_layers if config.num_layers is not None else 1
+    if n_layer <= 0:
+        raise ValueError(f"num_layers must be positive, got {n_layer}.")
+    kwargs: dict[str, Any] = {
+        "d_model": config.hidden_size,
+        "n_layer": n_layer,
+        "vocab_size": config.vocab_size,
+        "fused_add_norm": device.type == "cuda",
+        "rms_norm": device.type == "cuda",
+        "pad_vocab_size_multiple": 1,
+    }
+    if config.state_size is not None:
+        kwargs["ssm_cfg"] = {"d_state": config.state_size}
+    return config_cls(**kwargs)
+
+
+@contextmanager
+def _mamba_cpu_reference_kernel_patch(enabled: bool) -> Iterator[None]:
+    """Temporarily use public reference kernels for CPU-only smoke.
+
+    Some mamba-ssm builds expose CUDA-only causal-conv1d/selective-scan fast
+    paths even when tensors are on CPU. Stage 6C only needs an import/forward
+    smoke, so this temporarily switches the public module globals to CPU-capable
+    reference paths when mamba-ssm provides them.
+    """
+
+    if not enabled:
+        yield
+        return
+    try:
+        mamba_simple = importlib.import_module("mamba_ssm.modules.mamba_simple")
+        selective_scan_interface = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
+    except ImportError:
+        yield
+        return
+    original_selective_scan_fn = getattr(mamba_simple, "selective_scan_fn", None)
+    original_causal_conv1d_fn = getattr(mamba_simple, "causal_conv1d_fn", None)
+    if hasattr(selective_scan_interface, "selective_scan_ref"):
+        setattr(mamba_simple, "selective_scan_fn", selective_scan_interface.selective_scan_ref)
+    setattr(mamba_simple, "causal_conv1d_fn", None)
+    try:
+        yield
+    finally:
+        setattr(mamba_simple, "selective_scan_fn", original_selective_scan_fn)
+        setattr(mamba_simple, "causal_conv1d_fn", original_causal_conv1d_fn)
+
+
+def _validate_logits(logits: Tensor, input_ids: Tensor, vocab_size: int) -> None:
+    expected = (*input_ids.shape, vocab_size)
+    if logits.shape != expected:
+        raise RuntimeError(f"RealMambaStudent logits must have shape {expected}, got {tuple(logits.shape)}.")
