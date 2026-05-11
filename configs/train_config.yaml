@@ -1,4 +1,6 @@
 seed: 42
+teacher_type: mock
+student_type: mock
 mixed_precision: bf16
 gradient_accumulation_steps: 16
 learning_rate: 1e-4

@@ -4,7 +4,8 @@ This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
 Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
 training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
-teacher wrapper integration, and the Stage 5B teacher-logit cache scaffold:
+teacher wrapper integration, the Stage 5B teacher-logit cache scaffold, and
+the Stage 5C real-HF-teacher smoke training path with a mock student:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -34,9 +35,9 @@ shaped `[B, D]` or `[B, T, D]`.
   on-trajectory logits, off-trajectory logits, and detached fake logits.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
   shifted labels and `ignore_index` on the final placeholder token.
-- `train.py`: mock-only training loop with gradient accumulation, CUDA bf16
-  autocast when available, shared valid-position masking, and JSON console
-  metrics.
+- `train.py`: mock training plus an opt-in HuggingFace-teacher/mock-student
+  smoke path with gradient accumulation, CUDA-only autocast, shared
+  valid-position masking, and JSON console metrics.
 - `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
 - `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
 - `evals/perturbation_robustness.py`: token-weighted
@@ -97,6 +98,47 @@ Real KD requires compatible token indices between teacher and student, or an
 explicit cached/top-k teacher-logit path that maps indices correctly. The mock
 teacher remains the runnable default in `configs/model_config.yaml`; the
 `hf_teacher_example` block is documentation for future real-model runs.
+
+## Stage 5C HuggingFace Teacher Smoke Training
+
+The real teacher smoke path keeps the student mocked and does not implement
+real Mamba. It loads a frozen HuggingFace causal-LM teacher, derives the mock
+dataset and student vocab size from `teacher.model.config.vocab_size`, creates
+an all-ones `attention_mask`, and calls:
+
+```python
+teacher(input_ids, attention_mask=attention_mask)
+```
+
+The teacher never receives `h_t`, `h'_t`, `h_delta_alt`, or any other student
+state. `max_steps` counts optimizer steps; with
+`--gradient-accumulation-steps 2`, one logged optimizer step consumes two
+microbatches.
+
+Example local-only smoke command:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --teacher-type hf \
+  --student-type mock \
+  --teacher-model-name-or-path /path/to/local/hf-causal-lm \
+  --local-files-only \
+  --max_steps 1 \
+  --batch-size 1 \
+  --seq-len 128 \
+  --gradient-accumulation-steps 1 \
+  --mixed-precision no \
+  --csdm-weight 0.0
+```
+
+Tests for this path install a fake `transformers` module, so they run on CPU
+without downloads, HF login, or external model weights. The existing mock
+command remains unchanged:
+
+```bash
+python train.py --config configs/train_config.yaml --mock --max_steps 2
+```
 
 ## Stage 5B Teacher Logit Cache
 
