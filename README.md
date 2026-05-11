@@ -6,8 +6,9 @@ Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
 training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
 teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
 Stage 5C real-HF-teacher smoke training, Stage 5D top-k KD/CSDM support
-with a mock student, Stage 5E teacher-cache integration in training, and the
-Stage 6A optional real-Mamba student adapter scaffold:
+with a mock student, Stage 5E teacher-cache integration in training,
+Stage 6A optional real-Mamba student adapter scaffold, and Stage 6B Mamba
+dependency diagnostics:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -35,6 +36,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   masks, never Mamba states, and return token-prefix-aligned logits.
 - `utils/logit_cache.py`: optional teacher-logit cache utility for clean
   token-prefix teacher outputs, with full-logit and top-k storage modes.
+- `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
+  checks for `mamba_ssm` and `causal-conv1d`.
+- `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits, plus
   an optional `RealMambaStudent` Stage 6A scaffold with lazy `mamba_ssm`
@@ -57,6 +61,7 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   not a required dependency.
 - `configs/model_config.yaml`: mock teacher/student defaults plus an opt-in
   HuggingFace teacher example block.
+- `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
 
@@ -105,10 +110,51 @@ python train.py --config configs/train_config.yaml \
 Stage 6A intentionally raises a clear `ImportError` if `mamba-ssm` is missing.
 If the dependency is present, `RealMambaStudent.forward` raises
 `NotImplementedError` because real Mamba hidden-state extraction,
-delta-controlled transition perturbation, and `logits_from_state` wiring are
-future Stage 6B/6C work. The teacher path is unchanged: the teacher consumes
+delta-controlled transition perturbation, and `logits_from_state` wiring remain
+future work. The teacher path is unchanged: the teacher consumes
 only clean `input_ids` and optional `attention_mask`, never student recurrent
 states.
+
+## Stage 6B Mamba Dependency Diagnostics
+
+Stage 6B is an environment/import diagnostic only. Real Mamba dependencies are
+still optional, and the diagnostics CLI imports `mamba_ssm` and
+`causal_conv1d` only inside the explicit dependency check. Repository imports,
+mock training, and tests do not require a real Mamba installation:
+
+```bash
+python scripts/check_mamba_env.py
+python scripts/check_mamba_env.py --json
+```
+
+Missing Mamba dependencies are reported but do not fail the command by
+default. Use `--require-mamba` for environment-gating scripts that should fail
+unless both `mamba_ssm` and `causal_conv1d` can be imported:
+
+```bash
+python scripts/check_mamba_env.py --require-mamba
+```
+
+The CLI checks only runtime availability and does not change CSDM objectives,
+teacher usage, off-trajectory state construction, or training behavior. The
+teacher still consumes only clean token prefixes.
+
+Optional install attempts after installing a compatible PyTorch build:
+
+```bash
+pip install causal-conv1d>=1.4.0 --no-build-isolation
+pip install mamba-ssm --no-build-isolation
+```
+
+or:
+
+```bash
+pip install mamba-ssm[causal-conv1d] --no-build-isolation
+```
+
+These packages may compile CUDA extensions and can fail depending on PyTorch,
+CUDA, compiler, and driver versions. Optional install notes live in
+`docs/requirements-mamba.txt`.
 
 ## Stage 5D Top-k KD/CSDM
 

@@ -1,0 +1,21 @@
+# Optional real-Mamba dependencies.
+#
+# These packages are intentionally not part of requirements.txt. Mock training,
+# unit tests, and CSDM loss validation must run without mamba-ssm. Install them
+# only in an environment prepared for real Mamba student work.
+#
+# Recommended install attempt after PyTorch is installed:
+#
+#   pip install causal-conv1d>=1.4.0 --no-build-isolation
+#   pip install mamba-ssm --no-build-isolation
+#
+# Or:
+#
+#   pip install mamba-ssm[causal-conv1d] --no-build-isolation
+#
+# These packages may compile CUDA extensions. Installation can fail depending
+# on PyTorch, CUDA, compiler, and GPU driver versions. Keep this optional until
+# the real Mamba forward path is implemented in later stages.
+
+causal-conv1d>=1.4.0
+mamba-ssm
