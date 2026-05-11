@@ -5,6 +5,16 @@ learning_rate: 1e-4
 max_grad_norm: 1.0
 top_k_kd:
 
+teacher_cache:
+  enabled: false
+  cache_dir: cache/teacher_logits
+  format: pt
+  dtype: float16
+  device: cpu
+  use_top_k: false
+  top_k: 256
+  overwrite: false
+
 loss:
   ce_weight: 0.2
   kd_weight: 1.0

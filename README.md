@@ -3,10 +3,11 @@
 This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
 Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
-training scaffold, Stage 4 mock evaluation scaffolds, and Stage 5A
-HuggingFace teacher wrapper integration: configuration skeletons, KD/CSDM loss
-functions, off-trajectory student-state construction, mock teacher/student
-modules, token-weighted evaluation metrics, and unit tests with mock tensors.
+training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
+teacher wrapper integration, and the Stage 5B teacher-logit cache scaffold:
+configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
+construction, mock teacher/student modules, token-weighted evaluation metrics,
+teacher-logit cache utilities, and unit tests with mock tensors.
 
 No real Llama or Mamba modules are imported by default. The HuggingFace teacher
 wrapper imports `transformers` only when instantiated, so mock training and
@@ -27,6 +28,8 @@ shaped `[B, D]` or `[B, T, D]`.
 - `models/teacher_wrapper.py`: frozen mock teacher plus opt-in HuggingFace
   causal-LM teacher wrapper. Both consume only clean token IDs and attention
   masks, never Mamba states, and return token-prefix-aligned logits.
+- `utils/logit_cache.py`: optional teacher-logit cache utility for clean
+  token-prefix teacher outputs, with full-logit and top-k storage modes.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
@@ -94,6 +97,40 @@ Real KD requires compatible token indices between teacher and student, or an
 explicit cached/top-k teacher-logit path that maps indices correctly. The mock
 teacher remains the runnable default in `configs/model_config.yaml`; the
 `hf_teacher_example` block is documentation for future real-model runs.
+
+## Stage 5B Teacher Logit Cache
+
+`TeacherLogitCache` is a utility-only scaffold. It is not integrated into
+`train.py` or `evaluate.py`, and mock training does not require cache usage.
+
+```python
+from utils.logit_cache import LogitCacheConfig, TeacherLogitCache
+
+cache = TeacherLogitCache(LogitCacheConfig(enabled=True, cache_dir="/tmp/teacher_logits"))
+entry = cache.get_or_compute(
+    input_ids,
+    compute_fn=lambda input_ids, attention_mask=None: teacher(
+        input_ids,
+        attention_mask=attention_mask,
+    ),
+    attention_mask=attention_mask,
+    extra={"teacher": "mock", "tokenizer": "mock-v1"},
+)
+```
+
+Cache entries represent teacher outputs on clean token prefixes:
+`teacher(input_ids, attention_mask) -> logits` for
+`p_phi(y | x_{<=t})`. Cache keys include `input_ids`, optional
+`attention_mask` content and shape, and canonical JSON `extra`. Use `extra`
+only for teacher-output-affecting metadata such as teacher version, tokenizer
+version, or prompt formatting. Do not include student states, `rho`, `sigma`,
+`h_t`, `h_off`, `h_delta_alt`, adapter details, or other off-trajectory
+student-side data.
+
+Full logits must have shape `[B, T, V]`. In top-k mode the cache stores
+`topk_values` and `topk_indices` and omits full logits; downstream top-k KD
+needs explicit loss-side handling and is an approximation when full logits are
+not retained.
 
 ## Stage 4 Mock Evaluation
 
