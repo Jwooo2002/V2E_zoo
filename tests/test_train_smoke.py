@@ -293,6 +293,101 @@ def test_train_topk_only_teacher_cache_path_raises_not_implemented(tmp_path: Pat
         run_training(config, max_steps=1)
 
 
-def test_mock_training_imports_no_real_llama_or_mamba_modules() -> None:
-    forbidden = ("transformers", "mamba_ssm")
-    assert all(name not in sys.modules for name in forbidden)
+def test_mock_training_does_not_instantiate_real_teacher_or_student() -> None:
+    script = r"""
+import builtins
+import importlib
+import importlib.util
+import sys
+from pathlib import Path
+
+forbidden = ("transformers", "mamba_ssm")
+real_import = builtins.__import__
+real_import_module = importlib.import_module
+
+def is_forbidden(name):
+    return any(name == item or name.startswith(item + ".") for item in forbidden)
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if is_forbidden(name):
+        raise AssertionError(f"{name} imported during mock training isolation test")
+    return real_import(name, globals, locals, fromlist, level)
+
+def guarded_import_module(name, package=None):
+    if is_forbidden(name):
+        raise AssertionError(f"{name} imported through importlib during mock training isolation test")
+    return real_import_module(name, package)
+
+builtins.__import__ = guarded_import
+importlib.import_module = guarded_import_module
+
+root = Path.cwd()
+spec = importlib.util.spec_from_file_location("cdm_mamba_kd_train_isolation", root / "train.py")
+assert spec is not None
+assert spec.loader is not None
+train = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = train
+spec.loader.exec_module(train)
+
+calls = {"hf_teacher": 0, "real_mamba": 0}
+
+def forbidden_hf_teacher(*_args, **_kwargs):
+    calls["hf_teacher"] += 1
+    raise AssertionError("HuggingFaceTeacherWrapper should not be instantiated for mock training")
+
+def forbidden_real_mamba(*_args, **_kwargs):
+    calls["real_mamba"] += 1
+    raise AssertionError("RealMambaStudent should not be instantiated for mock training")
+
+train.HuggingFaceTeacherWrapper = forbidden_hf_teacher
+train.RealMambaStudent = forbidden_real_mamba
+
+config = train.derive_runtime_config(
+    train.argparse.Namespace(
+        config=root / "configs" / "train_config.yaml",
+        mock=True,
+        max_steps=1,
+        teacher_type="hf",
+        student_type="mamba",
+        teacher_model_name_or_path="forbidden-teacher",
+        student_model_name_or_path="forbidden-student",
+        student_vocab_size=None,
+        student_hidden_size=None,
+        seq_len=8,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        mixed_precision="no",
+        csdm_weight=None,
+        kd_weight=None,
+        ce_weight=None,
+        local_files_only=True,
+        topk_enabled=None,
+        top_k=None,
+        topk_include_labels=None,
+        topk_renormalize=None,
+        teacher_cache_enabled=False,
+        teacher_cache_dir=None,
+        teacher_cache_dtype=None,
+        teacher_cache_overwrite=False,
+        teacher_cache_use_top_k=False,
+        teacher_cache_top_k=None,
+        hf_torch_dtype=None,
+        hf_device_map=None,
+        trust_remote_code=False,
+        hf_attn_implementation=None,
+        use_safetensors=None,
+        load_in_8bit=False,
+        load_in_4bit=False,
+    )
+)
+train.run_training(config, max_steps=1)
+assert calls == {"hf_teacher": 0, "real_mamba": 0}
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )

@@ -79,14 +79,47 @@ def test_eval_needle_cli_smoke() -> None:
     assert metrics["mode"] == "synthetic_mock"
 
 
-def test_eval_modules_import_no_real_llama_or_mamba_modules() -> None:
-    importlib.import_module("evals.perplexity")
-    importlib.import_module("evals.perturbation_robustness")
-    importlib.import_module("evals.needle")
-    importlib.import_module("evaluate")
+def test_eval_module_imports_do_not_require_real_llama_or_mamba_modules() -> None:
+    code = """
+import builtins
+import importlib
 
-    forbidden = ("transformers", "mamba_ssm")
-    assert all(name not in sys.modules for name in forbidden)
+forbidden = ('transformers', 'mamba_ssm')
+real_import = builtins.__import__
+real_import_module = importlib.import_module
+
+def is_forbidden(name):
+    return any(name == item or name.startswith(item + '.') for item in forbidden)
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if is_forbidden(name):
+        raise AssertionError(f'{name} imported by mock eval module import')
+    return real_import(name, globals, locals, fromlist, level)
+
+def guarded_import_module(name, package=None):
+    if is_forbidden(name):
+        raise AssertionError(f'{name} imported through importlib by mock eval module import')
+    return real_import_module(name, package)
+
+builtins.__import__ = guarded_import
+importlib.import_module = guarded_import_module
+importlib.import_module('evals.perplexity')
+importlib.import_module('evals.perturbation_robustness')
+importlib.import_module('evals.needle')
+importlib.import_module('evaluate')
+print('ok')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 def test_direct_eval_has_no_gradients_and_finite_metrics() -> None:
