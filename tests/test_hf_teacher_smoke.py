@@ -47,14 +47,20 @@ def install_fake_transformers(monkeypatch: pytest.MonkeyPatch) -> type[nn.Module
         def __init__(self) -> None:
             super().__init__()
             self.weight = nn.Parameter(torch.ones(()))
+            self.input_embeddings = nn.Embedding(FAKE_VOCAB_SIZE, 4)
             self.config = types.SimpleNamespace(vocab_size=FAKE_VOCAB_SIZE)
             self.forward_grad_enabled: bool | None = None
             self.forward_attention_mask: torch.Tensor | None = None
+            self.forward_input_device: torch.device | None = None
+            self.forward_attention_mask_device: torch.device | None = None
             FakeModel.instances.append(self)
 
         @classmethod
         def from_pretrained(cls, *_args: object, **_kwargs: object) -> "FakeModel":
             return cls()
+
+        def get_input_embeddings(self) -> nn.Embedding:
+            return self.input_embeddings
 
         def forward(
             self,
@@ -64,6 +70,8 @@ def install_fake_transformers(monkeypatch: pytest.MonkeyPatch) -> type[nn.Module
         ) -> object:
             self.forward_grad_enabled = torch.is_grad_enabled()
             self.forward_attention_mask = attention_mask
+            self.forward_input_device = input_ids.device
+            self.forward_attention_mask_device = None if attention_mask is None else attention_mask.device
             FakeModel.max_input_id = int(input_ids.max().item())
             FakeModel.forward_calls += 1
             base = torch.arange(FAKE_VOCAB_SIZE, dtype=torch.float32, device=input_ids.device)
@@ -119,6 +127,8 @@ def test_hf_teacher_mock_student_training_smoke_no_downloads(monkeypatch: pytest
     assert fake_model.forward_grad_enabled is False
     assert fake_model.forward_attention_mask is not None
     assert torch.equal(fake_model.forward_attention_mask, torch.ones_like(fake_model.forward_attention_mask))
+    assert fake_model.forward_input_device == fake_model.input_embeddings.weight.device
+    assert fake_model.forward_attention_mask_device == fake_model.input_embeddings.weight.device
     assert FakeModel.max_input_id is not None and FakeModel.max_input_id < FAKE_VOCAB_SIZE  # type: ignore[attr-defined]
     assert all(not parameter.requires_grad for parameter in fake_model.parameters())
 
@@ -141,10 +151,13 @@ def test_hf_teacher_wrapper_returns_detached_logits_and_frozen_params(
     attention_mask = torch.ones_like(input_ids)
     logits = wrapper(input_ids, attention_mask=attention_mask)
 
+    assert wrapper.teacher_input_device == fake_model.input_embeddings.weight.device
     assert logits.shape == (2, 4, FAKE_VOCAB_SIZE)
     assert not logits.requires_grad
     assert fake_model.forward_grad_enabled is False
     assert fake_model.forward_attention_mask is attention_mask
+    assert fake_model.forward_input_device == wrapper.teacher_input_device
+    assert fake_model.forward_attention_mask_device == wrapper.teacher_input_device
     assert all(not parameter.requires_grad for parameter in wrapper.model.parameters())
 
 
@@ -191,6 +204,34 @@ def test_hf_cpu_device_map_keeps_training_device_on_cpu(monkeypatch: pytest.Monk
     config = replace(config, hf_teacher=replace(config.hf_teacher, device_map="cpu"))
 
     assert train._training_device(config) == torch.device("cpu")
+
+
+def test_train_moves_teacher_logits_and_labels_to_student_logits_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_transformers(monkeypatch)
+    logger = RecordingLogger()
+    seen_loss_call = False
+
+    def assert_loss_devices(output, teacher_logits, labels, config):
+        nonlocal seen_loss_call
+        seen_loss_call = True
+        assert teacher_logits.device == output.on_logits.device
+        assert labels.device == output.on_logits.device
+        total = output.on_logits.sum() * 0.0
+        return {
+            "total": total,
+            "ce": total.detach(),
+            "kd": total.detach(),
+            "csdm": total.detach(),
+        }
+
+    monkeypatch.setattr(train, "compute_losses", assert_loss_devices)
+
+    train.run_training(tiny_hf_config(), max_steps=1, logger=logger)  # type: ignore[arg-type]
+
+    assert seen_loss_call
+    assert logger.records[0]["step"] == 1
 
 
 def test_nonfinite_loss_raises_before_backward(monkeypatch: pytest.MonkeyPatch) -> None:

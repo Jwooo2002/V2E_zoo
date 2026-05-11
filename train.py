@@ -502,6 +502,9 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             with autocast_context:
                 teacher_logits = teacher(input_ids, attention_mask=attention_mask)
                 output = student(input_ids)
+                loss_device = output.on_logits.device
+                teacher_logits = teacher_logits.to(loss_device)
+                labels = labels.to(loss_device)
                 losses = compute_losses(output, teacher_logits, labels, config)
                 for name, value in losses.items():
                     if not torch.isfinite(value):

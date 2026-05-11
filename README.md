@@ -99,6 +99,13 @@ explicit cached/top-k teacher-logit path that maps indices correctly. The mock
 teacher remains the runnable default in `configs/model_config.yaml`; the
 `hf_teacher_example` block is documentation for future real-model runs.
 
+When using `device_map="auto"`, Transformers may shard the teacher across
+devices. The wrapper moves clean `input_ids` and optional `attention_mask` to
+the teacher input embedding device before calling the frozen teacher, and the
+training loop moves returned teacher logits back to the student logits device
+before loss computation. If a local HF smoke run still hits a placement issue,
+`CUDA_VISIBLE_DEVICES=0` remains the simplest single-device workaround.
+
 By default the HF teacher asks Transformers to load safetensors weights
 (`use_safetensors=True`). If a legacy model only ships PyTorch `.bin`
 checkpoints, prefer a safetensors variant of the model. Set

@@ -39,9 +39,12 @@ def _install_fake_transformers(
         def __init__(self) -> None:
             super().__init__()
             self.weight = nn.Parameter(torch.ones(()))
+            self.input_embeddings = nn.Embedding(5, 3)
             self.eval_called = False
             self.forward_grad_enabled: bool | None = None
             self.forward_attention_mask: torch.Tensor | None = None
+            self.forward_input_device: torch.device | None = None
+            self.forward_attention_mask_device: torch.device | None = None
             FakeModel.instances.append(self)
 
         @classmethod
@@ -53,6 +56,9 @@ def _install_fake_transformers(
             self.eval_called = True
             return super().eval()
 
+        def get_input_embeddings(self) -> nn.Embedding:
+            return self.input_embeddings
+
         def forward(
             self,
             *,
@@ -61,6 +67,8 @@ def _install_fake_transformers(
         ) -> object:
             self.forward_grad_enabled = torch.is_grad_enabled()
             self.forward_attention_mask = attention_mask
+            self.forward_input_device = input_ids.device
+            self.forward_attention_mask_device = None if attention_mask is None else attention_mask.device
             logits = torch.ones(input_ids.shape[0], input_ids.shape[1], 19, requires_grad=True)
             return types.SimpleNamespace(logits=logits)
 
@@ -194,6 +202,7 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
     assert wrapper.model is fake_model
     assert fake_model.eval_called
     assert all(not parameter.requires_grad for parameter in fake_model.parameters())
+    assert wrapper.teacher_input_device == fake_model.input_embeddings.weight.device
 
     input_ids = torch.randint(0, 13, (2, 4))
     attention_mask = torch.ones_like(input_ids)
@@ -201,8 +210,68 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
 
     assert fake_model.forward_grad_enabled is False
     assert fake_model.forward_attention_mask is attention_mask
+    assert fake_model.forward_input_device == wrapper.teacher_input_device
+    assert fake_model.forward_attention_mask_device == wrapper.teacher_input_device
     assert logits.shape == (2, 4, 19)
     assert not logits.requires_grad
+
+
+def test_hf_teacher_input_device_prefers_input_embedding_device() -> None:
+    class MetaEmbeddingModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+            self.input_embedding_weight = torch.empty(3, 2, device="meta")
+            self.forward_input_device: torch.device | None = None
+            self.forward_attention_mask_device: torch.device | None = None
+
+        def get_input_embeddings(self) -> object:
+            return types.SimpleNamespace(weight=self.input_embedding_weight)
+
+        def forward(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+        ) -> object:
+            self.forward_input_device = input_ids.device
+            self.forward_attention_mask_device = None if attention_mask is None else attention_mask.device
+            logits = torch.empty(input_ids.shape[0], input_ids.shape[1], 7, device=input_ids.device)
+            return types.SimpleNamespace(logits=logits)
+
+    wrapper = HuggingFaceTeacherWrapper.__new__(HuggingFaceTeacherWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.model = MetaEmbeddingModel()
+
+    assert wrapper.teacher_input_device == torch.device("meta")
+
+    logits = wrapper(torch.ones(2, 3, dtype=torch.long), attention_mask=torch.ones(2, 3, dtype=torch.long))
+
+    assert wrapper.model.forward_input_device == torch.device("meta")
+    assert wrapper.model.forward_attention_mask_device == torch.device("meta")
+    assert logits.device == torch.device("meta")
+    assert not logits.requires_grad
+
+
+def test_hf_teacher_input_device_falls_back_to_parameter_then_cpu() -> None:
+    class ParameterOnlyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+
+    class EmptyModel(nn.Module):
+        pass
+
+    parameter_wrapper = HuggingFaceTeacherWrapper.__new__(HuggingFaceTeacherWrapper)
+    nn.Module.__init__(parameter_wrapper)
+    parameter_wrapper.model = ParameterOnlyModel()
+
+    empty_wrapper = HuggingFaceTeacherWrapper.__new__(HuggingFaceTeacherWrapper)
+    nn.Module.__init__(empty_wrapper)
+    empty_wrapper.model = EmptyModel()
+
+    assert parameter_wrapper.teacher_input_device == torch.device("cpu")
+    assert empty_wrapper.teacher_input_device == torch.device("cpu")
 
 
 def test_hf_wrapper_omits_non_quantized_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:

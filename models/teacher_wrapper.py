@@ -34,6 +34,10 @@ class MockTeacherWrapper(TeacherWrapper):
             parameter.requires_grad_(False)
         self.eval()
 
+    @property
+    def teacher_input_device(self) -> torch.device:
+        return self.embedding.weight.device
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}.")
@@ -170,6 +174,21 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
 
+    @property
+    def teacher_input_device(self) -> torch.device:
+        try:
+            input_embeddings = self.model.get_input_embeddings()
+            weight = getattr(input_embeddings, "weight", None)
+            if weight is not None:
+                return weight.device
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}.")
@@ -178,6 +197,10 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
                 "attention_mask must have the same shape as input_ids, "
                 f"got {tuple(attention_mask.shape)} and {tuple(input_ids.shape)}."
             )
+        input_device = self.teacher_input_device
+        input_ids = input_ids.to(input_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(input_device)
         with torch.no_grad():
             output = self.model(input_ids=input_ids, attention_mask=attention_mask)
         return output.logits.detach()
