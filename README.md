@@ -2,9 +2,10 @@
 
 This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
-Stage 1 plus Stage 2 mock-state engine pieces: configuration skeletons,
-KD/CSDM loss functions, off-trajectory student-state construction, and unit
-tests with mock tensors.
+Stage 1 plus Stage 2 mock-state engine pieces and the Stage 3 minimal mock
+training scaffold: configuration skeletons, KD/CSDM loss functions,
+off-trajectory student-state construction, mock teacher/student modules, and
+unit tests with mock tensors.
 
 No real Llama or Mamba modules are imported in the implemented stages. The
 implemented losses operate on logits shaped `[B, T, V]` or `[B, N, V]`. The
@@ -20,10 +21,42 @@ Stage 2 engine operates on mock student recurrent states shaped `[B, D]` or
 - `models/cdm_engine.py`: delta-perturbation off-state engine for mock Mamba
   student states, with strict alternate-state validation and placeholder
   adapter interface.
+- `models/teacher_wrapper.py`: frozen mock teacher that consumes only clean
+  token IDs and returns token-prefix-aligned logits.
+- `models/student_mamba.py`: lightweight mock student that produces
+  on-trajectory logits, off-trajectory logits, and detached fake logits.
+- `data/dataset.py`: deterministic random-token mock dataset with next-token
+  shifted labels and `ignore_index` on the final placeholder token.
+- `train.py`: mock-only training loop with gradient accumulation, CUDA bf16
+  autocast when available, shared valid-position masking, and JSON console
+  metrics.
 - `configs/train_config.yaml`: minimal training/loss defaults for mock mode.
+- `configs/ds_config.json`: placeholder future DeepSpeed config; DeepSpeed is
+  not a required dependency.
 - `configs/model_config.yaml`: model-role placeholders without real imports.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
+
+## Stage 3 Mock Training
+
+Run two optimizer steps without real Llama or Mamba imports:
+
+```bash
+python train.py --config configs/train_config.yaml --mock --max_steps 2
+```
+
+`MockTextDataset` creates labels by shifting tokens left for next-token
+prediction and sets `labels[-1] = -100`. The training loop applies one shared
+valid-position mask to CE, on-trajectory KD, and off-trajectory CSDM, so the
+last placeholder token is excluded from all three objectives.
+
+Teacher/student alignment is token-prefix based: `teacher_logits[:, t]`
+represents `p_phi(y | x_{<=t})` and is aligned with `on_logits[:, t]` and
+`off_logits[:, t]`. The teacher never receives `h_t`, `h'_t`, `h_delta_alt`, or
+any Mamba state. The mock student's `h_delta_alt` is only a student-side
+surrogate used to exercise the off-trajectory engine; it is not real Mamba
+delta behavior. Fake logits are detached at the producer boundary before being
+passed to `csdm_loss`.
 
 ## Stage 2 Off-State Engine
 
