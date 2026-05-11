@@ -1,0 +1,11 @@
+teacher:
+  type: frozen_transformer
+  load_weights: false
+  logits_cache: true
+
+student:
+  type: mamba
+  load_weights: false
+
+stage: 1
+real_model_imports: false

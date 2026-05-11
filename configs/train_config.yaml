@@ -1,0 +1,19 @@
+seed: 1337
+precision: bf16
+gradient_accumulation_steps: 1
+
+loss:
+  ce_weight: 1.0
+  kd_weight: 1.0
+  csdm_weight: 0.1
+  tau: 2.0
+  lambda_score: 0.1
+  residual_clip: 3.0
+  scale_min: 0.05
+  scale_max: 5.0
+
+mock:
+  enabled: true
+  batch_size: 2
+  sequence_length: 4
+  vocab_size: 16

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Logs / outputs
+logs/
+runs/
+outputs/
+checkpoints/
+*.log
+
+# Large model/data files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+data/raw/
+data/processed/

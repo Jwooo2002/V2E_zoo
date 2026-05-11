@@ -1,0 +1,6 @@
+name: cdm-mamba-kd
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /home/jiwoong/anaconda3/envs/cdm-mamba-kd
