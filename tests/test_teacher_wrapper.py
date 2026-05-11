@@ -21,6 +21,55 @@ from models.teacher_wrapper import (
 )
 
 
+def _install_fake_transformers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], type[object], type[nn.Module]]:
+    fake_transformers = types.ModuleType("transformers")
+    calls: dict[str, object] = {}
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_name_or_path: str, **kwargs: object) -> "FakeTokenizer":
+            calls["tokenizer"] = (model_name_or_path, kwargs)
+            return cls()
+
+    class FakeModel(nn.Module):
+        instances: list["FakeModel"] = []
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+            self.eval_called = False
+            self.forward_grad_enabled: bool | None = None
+            self.forward_attention_mask: torch.Tensor | None = None
+            FakeModel.instances.append(self)
+
+        @classmethod
+        def from_pretrained(cls, model_name_or_path: str, **kwargs: object) -> "FakeModel":
+            calls["model"] = (model_name_or_path, kwargs)
+            return cls()
+
+        def eval(self) -> "FakeModel":
+            self.eval_called = True
+            return super().eval()
+
+        def forward(
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+        ) -> object:
+            self.forward_grad_enabled = torch.is_grad_enabled()
+            self.forward_attention_mask = attention_mask
+            logits = torch.ones(input_ids.shape[0], input_ids.shape[1], 19, requires_grad=True)
+            return types.SimpleNamespace(logits=logits)
+
+    fake_transformers.AutoModelForCausalLM = FakeModel
+    fake_transformers.AutoTokenizer = FakeTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    return calls, FakeTokenizer, FakeModel
+
+
 def test_mock_teacher_returns_frozen_no_grad_logits_with_attention_mask() -> None:
     teacher = MockTeacherWrapper(vocab_size=17, hidden_size=8)
     input_ids = torch.randint(0, 17, (2, 5))
@@ -107,49 +156,7 @@ def test_hf_wrapper_import_error_is_informative(monkeypatch: pytest.MonkeyPatch)
 def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_transformers = types.ModuleType("transformers")
-    calls: dict[str, object] = {}
-
-    class FakeTokenizer:
-        @classmethod
-        def from_pretrained(cls, model_name_or_path: str, **kwargs: object) -> "FakeTokenizer":
-            calls["tokenizer"] = (model_name_or_path, kwargs)
-            return cls()
-
-    class FakeModel(nn.Module):
-        instances: list["FakeModel"] = []
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(()))
-            self.eval_called = False
-            self.forward_grad_enabled: bool | None = None
-            self.forward_attention_mask: torch.Tensor | None = None
-            FakeModel.instances.append(self)
-
-        @classmethod
-        def from_pretrained(cls, model_name_or_path: str, **kwargs: object) -> "FakeModel":
-            calls["model"] = (model_name_or_path, kwargs)
-            return cls()
-
-        def eval(self) -> "FakeModel":
-            self.eval_called = True
-            return super().eval()
-
-        def forward(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-        ) -> object:
-            self.forward_grad_enabled = torch.is_grad_enabled()
-            self.forward_attention_mask = attention_mask
-            logits = torch.ones(input_ids.shape[0], input_ids.shape[1], 19, requires_grad=True)
-            return types.SimpleNamespace(logits=logits)
-
-    fake_transformers.AutoModelForCausalLM = FakeModel
-    fake_transformers.AutoTokenizer = FakeTokenizer
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    calls, FakeTokenizer, FakeModel = _install_fake_transformers(monkeypatch)
 
     config = HuggingFaceTeacherConfig(
         model_name_or_path="tiny-local-model",
@@ -159,7 +166,6 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
         attn_implementation="flash_attention_2",
         local_files_only=True,
         load_in_8bit=True,
-        load_in_4bit=False,
     )
     wrapper = HuggingFaceTeacherWrapper(config)
     fake_model = FakeModel.instances[-1]
@@ -175,7 +181,6 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
         "trust_remote_code": True,
         "local_files_only": True,
         "load_in_8bit": True,
-        "load_in_4bit": False,
         "attn_implementation": "flash_attention_2",
     }
     assert wrapper.tokenizer.__class__ is FakeTokenizer
@@ -191,6 +196,73 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
     assert fake_model.forward_attention_mask is attention_mask
     assert logits.shape == (2, 4, 19)
     assert not logits.requires_grad
+
+
+def test_hf_wrapper_omits_non_quantized_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls, _, _ = _install_fake_transformers(monkeypatch)
+
+    config = HuggingFaceTeacherConfig(
+        model_name_or_path="tiny-local-model",
+        torch_dtype="float32",
+        device_map="cpu",
+    )
+    HuggingFaceTeacherWrapper(config)
+
+    _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert "load_in_8bit" not in model_kwargs
+    assert "load_in_4bit" not in model_kwargs
+
+
+def test_hf_wrapper_passes_8bit_quantization_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _, _ = _install_fake_transformers(monkeypatch)
+
+    config = HuggingFaceTeacherConfig(
+        model_name_or_path="tiny-local-model",
+        torch_dtype="float32",
+        device_map="cpu",
+        load_in_8bit=True,
+    )
+    HuggingFaceTeacherWrapper(config)
+
+    _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert model_kwargs["load_in_8bit"] is True
+    assert "load_in_4bit" not in model_kwargs
+
+
+def test_hf_wrapper_passes_4bit_quantization_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _, _ = _install_fake_transformers(monkeypatch)
+
+    config = HuggingFaceTeacherConfig(
+        model_name_or_path="tiny-local-model",
+        torch_dtype="float32",
+        device_map="cpu",
+        load_in_4bit=True,
+    )
+    HuggingFaceTeacherWrapper(config)
+
+    _, model_kwargs = calls["model"]  # type: ignore[misc]
+    assert "load_in_8bit" not in model_kwargs
+    assert model_kwargs["load_in_4bit"] is True
+
+
+def test_hf_wrapper_rejects_both_quantization_modes_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _, _ = _install_fake_transformers(monkeypatch)
+
+    config = HuggingFaceTeacherConfig(
+        model_name_or_path="tiny-local-model",
+        load_in_8bit=True,
+        load_in_4bit=True,
+    )
+
+    with pytest.raises(ValueError, match="load_in_8bit and load_in_4bit cannot both be True"):
+        HuggingFaceTeacherWrapper(config)
+    assert calls == {}
 
 
 def test_hf_wrapper_wraps_loading_failures(monkeypatch: pytest.MonkeyPatch) -> None:

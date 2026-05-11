@@ -107,6 +107,9 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
 
     def __init__(self, config: HuggingFaceTeacherConfig) -> None:
         super().__init__()
+        if config.load_in_8bit and config.load_in_4bit:
+            raise ValueError("load_in_8bit and load_in_4bit cannot both be True.")
+
         self.config = config
         AutoModelForCausalLM, AutoTokenizer = _load_transformers_classes()
 
@@ -119,9 +122,11 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
             "device_map": config.device_map,
             "trust_remote_code": config.trust_remote_code,
             "local_files_only": config.local_files_only,
-            "load_in_8bit": config.load_in_8bit,
-            "load_in_4bit": config.load_in_4bit,
         }
+        if config.load_in_8bit:
+            model_kwargs["load_in_8bit"] = True
+        if config.load_in_4bit:
+            model_kwargs["load_in_4bit"] = True
         if config.attn_implementation is not None:
             model_kwargs["attn_implementation"] = config.attn_implementation
 
