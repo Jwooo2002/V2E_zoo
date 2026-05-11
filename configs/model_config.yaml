@@ -1,11 +1,30 @@
 teacher:
-  type: frozen_transformer
+  type: mock
   load_weights: false
   logits_cache: true
+  mock:
+    vocab_size: 1024
+    hidden_size: 256
 
 student:
-  type: mamba
+  type: mock_mamba
   load_weights: false
 
-stage: 1
+hf_teacher_example:
+  enabled: false
+  type: hf
+  model_name_or_path: meta-llama/Meta-Llama-3-8B-Instruct
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  attn_implementation:
+  local_files_only: false
+  load_in_8bit: false
+  load_in_4bit: false
+  notes:
+    - Opt-in only; mock teacher remains the runnable default.
+    - Set local_files_only true when using a pre-downloaded local cache/path.
+    - Real KD requires compatible token indices or cached/top-k teacher logits.
+
+stage: 5A
 real_model_imports: false

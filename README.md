@@ -3,15 +3,17 @@
 This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
 Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
-training scaffold, and Stage 4 mock evaluation scaffolds: configuration
-skeletons, KD/CSDM loss functions, off-trajectory student-state construction,
-mock teacher/student modules, token-weighted evaluation metrics, and unit tests
-with mock tensors.
+training scaffold, Stage 4 mock evaluation scaffolds, and Stage 5A
+HuggingFace teacher wrapper integration: configuration skeletons, KD/CSDM loss
+functions, off-trajectory student-state construction, mock teacher/student
+modules, token-weighted evaluation metrics, and unit tests with mock tensors.
 
-No real Llama or Mamba modules are imported in the implemented stages. The
-implemented losses operate on logits shaped `[B, T, V]` or `[B, N, V]`. The
-Stage 2 engine operates on mock student recurrent states shaped `[B, D]` or
-`[B, T, D]`.
+No real Llama or Mamba modules are imported by default. The HuggingFace teacher
+wrapper imports `transformers` only when instantiated, so mock training and
+tests do not require Llama weights, HF login, external downloads, or
+`transformers`. The implemented losses operate on logits shaped `[B, T, V]` or
+`[B, N, V]`. The Stage 2 engine operates on mock student recurrent states
+shaped `[B, D]` or `[B, T, D]`.
 
 ## Implemented Files
 
@@ -22,8 +24,9 @@ Stage 2 engine operates on mock student recurrent states shaped `[B, D]` or
 - `models/cdm_engine.py`: delta-perturbation off-state engine for mock Mamba
   student states, with strict alternate-state validation and placeholder
   adapter interface.
-- `models/teacher_wrapper.py`: frozen mock teacher that consumes only clean
-  token IDs and returns token-prefix-aligned logits.
+- `models/teacher_wrapper.py`: frozen mock teacher plus opt-in HuggingFace
+  causal-LM teacher wrapper. Both consume only clean token IDs and attention
+  masks, never Mamba states, and return token-prefix-aligned logits.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
@@ -41,7 +44,8 @@ Stage 2 engine operates on mock student recurrent states shaped `[B, D]` or
 - `configs/train_config.yaml`: minimal training/loss defaults for mock mode.
 - `configs/ds_config.json`: placeholder future DeepSpeed config; DeepSpeed is
   not a required dependency.
-- `configs/model_config.yaml`: model-role placeholders without real imports.
+- `configs/model_config.yaml`: mock teacher/student defaults plus an opt-in
+  HuggingFace teacher example block.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
 
@@ -65,6 +69,31 @@ any Mamba state. The mock student's `h_delta_alt` is only a student-side
 surrogate used to exercise the off-trajectory engine; it is not real Mamba
 delta behavior. Fake logits are detached at the producer boundary before being
 passed to `csdm_loss`.
+
+## Stage 5A HuggingFace Teacher Wrapper
+
+`HuggingFaceTeacherWrapper` is an opt-in frozen causal-LM teacher:
+
+```python
+from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper
+
+teacher = HuggingFaceTeacherWrapper(
+    HuggingFaceTeacherConfig(
+        model_name_or_path="/path/to/local/model",
+        torch_dtype="bfloat16",
+        device_map="auto",
+        local_files_only=True,
+    )
+)
+teacher_logits = teacher(input_ids, attention_mask=attention_mask)
+```
+
+The wrapper returns raw causal-LM logits and does not shift labels or compute
+loss. `logits[:, t]` is the next-token distribution after prefix `x_{<=t}`.
+Real KD requires compatible token indices between teacher and student, or an
+explicit cached/top-k teacher-logit path that maps indices correctly. The mock
+teacher remains the runnable default in `configs/model_config.yaml`; the
+`hf_teacher_example` block is documentation for future real-model runs.
 
 ## Stage 4 Mock Evaluation
 

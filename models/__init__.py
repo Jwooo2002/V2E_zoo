@@ -5,10 +5,18 @@ from .cdm_engine import (
     StateBatch,
 )
 from .student_mamba import MockStudentMamba, StudentMamba, StudentOutput
-from .teacher_wrapper import MockTeacherWrapper, TeacherWrapper
+from .teacher_wrapper import (
+    HuggingFaceTeacherConfig,
+    HuggingFaceTeacherWrapper,
+    MockTeacherWrapper,
+    TeacherWrapper,
+    parse_torch_dtype,
+)
 
 __all__ = [
     "DeltaPerturbationEngine",
+    "HuggingFaceTeacherConfig",
+    "HuggingFaceTeacherWrapper",
     "MambaStateAdapter",
     "MockStudentMamba",
     "MockTeacherWrapper",
@@ -17,4 +25,5 @@ __all__ = [
     "StudentMamba",
     "StudentOutput",
     "TeacherWrapper",
+    "parse_torch_dtype",
 ]
