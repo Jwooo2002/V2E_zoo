@@ -152,6 +152,8 @@ class MambaStateAdapter:
 
         Expected mock-compatible shapes:
         - ``input_ids``: ``[B, T]``
+        - optional ``attention_mask`` keyword: ``[B, T]`` when the concrete
+          student adapter supports masks
         - returned ``StateBatch.h``: ``[B, T, D]`` or selected states ``[B, D]``
         - returned ``StateBatch.delta`` when available: adapter-defined student
           transition deltas broadcastable inside the adapter only
@@ -170,8 +172,10 @@ class MambaStateAdapter:
 
         ``delta_scale`` is where ``OffTrajectoryConfig.delta_perturb_eps`` is
         intended to be applied by concrete adapters. Expected returned
-        ``StateBatch.h`` shape must match ``forward_clean(...).h`` exactly, such
-        as ``[B, T, D]`` or ``[B, D]``.
+        ``StateBatch.h`` shape must match ``forward_clean(input_ids,
+        attention_mask=...).h`` exactly, such as ``[B, T, D]`` or ``[B, D]``.
+        ``input_ids`` and optional ``attention_mask`` remain clean token inputs;
+        ``delta_scale`` is applied only inside student-side transition logic.
         """
 
         raise NotImplementedError
@@ -182,6 +186,8 @@ class MambaStateAdapter:
         Expected mock-compatible shapes:
         - ``h``: ``[B, T, D]`` or ``[B, D]``
         - returned logits: ``[B, T, V]`` or ``[B, V]`` from the student head
+        This method projects student states only. It must not call a teacher or
+        pass student recurrent states to a teacher model.
         """
 
         raise NotImplementedError

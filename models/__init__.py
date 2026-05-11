@@ -4,7 +4,13 @@ from .cdm_engine import (
     OffTrajectoryConfig,
     StateBatch,
 )
-from .student_mamba import MockStudentMamba, StudentMamba, StudentOutput
+from .student_mamba import (
+    MambaStudentConfig,
+    MockStudentMamba,
+    RealMambaStudent,
+    StudentMamba,
+    StudentOutput,
+)
 from .teacher_wrapper import (
     HuggingFaceTeacherConfig,
     HuggingFaceTeacherWrapper,
@@ -18,9 +24,11 @@ __all__ = [
     "HuggingFaceTeacherConfig",
     "HuggingFaceTeacherWrapper",
     "MambaStateAdapter",
+    "MambaStudentConfig",
     "MockStudentMamba",
     "MockTeacherWrapper",
     "OffTrajectoryConfig",
+    "RealMambaStudent",
     "StateBatch",
     "StudentMamba",
     "StudentOutput",

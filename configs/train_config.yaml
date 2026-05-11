@@ -6,6 +6,21 @@ gradient_accumulation_steps: 16
 learning_rate: 1e-4
 max_grad_norm: 1.0
 
+student:
+  type: mock
+  model_name_or_path:
+  vocab_size: 50257
+  hidden_size: 768
+  num_layers:
+  state_size:
+  torch_dtype: bfloat16
+  device:
+  trust_remote_code: false
+  use_pretrained: false
+  local_files_only: false
+  delta_perturb_eps: 0.10
+  noise_sigma: 0.01
+
 topk:
   enabled: false
   top_k: 256

@@ -1,9 +1,11 @@
-"""Mock Mamba student for Stage 3 training scaffolding."""
+"""Mock and real-Mamba student adapter scaffolds."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import importlib
+from types import ModuleType
 
 import torch
 from torch import Tensor, nn
@@ -21,11 +23,29 @@ class StudentOutput:
     h_delta_alt: Tensor
 
 
+@dataclass(frozen=True)
+class MambaStudentConfig:
+    """Configuration for the optional real Mamba student scaffold."""
+
+    model_name_or_path: str | None = None
+    vocab_size: int = 50257
+    hidden_size: int = 768
+    num_layers: int | None = None
+    state_size: int | None = None
+    torch_dtype: str = "bfloat16"
+    device: str | None = None
+    trust_remote_code: bool = False
+    use_pretrained: bool = False
+    local_files_only: bool = False
+    delta_perturb_eps: float = 0.10
+    noise_sigma: float = 0.01
+
+
 class StudentMamba(nn.Module, ABC):
     """Base student interface for future real Mamba integrations."""
 
     @abstractmethod
-    def forward(self, input_ids: Tensor) -> StudentOutput:
+    def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> StudentOutput:
         """Return on/off-trajectory student logits."""
 
 
@@ -56,7 +76,8 @@ class MockStudentMamba(StudentMamba):
         self.delta_scale = delta_scale
         self.off_engine = DeltaPerturbationEngine(off_config)
 
-    def forward(self, input_ids: Tensor) -> StudentOutput:
+    def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> StudentOutput:
+        del attention_mask
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}.")
         embeddings = self.embedding(input_ids)
@@ -78,4 +99,40 @@ class MockStudentMamba(StudentMamba):
             h=h,
             h_off=h_off,
             h_delta_alt=h_delta_alt,
+        )
+
+
+class RealMambaStudent(StudentMamba):
+    """Opt-in real Mamba student adapter placeholder for Stage 6A.
+
+    This class intentionally imports ``mamba_ssm`` lazily and does not touch
+    private Mamba internals. Real hidden-state extraction, delta perturbation,
+    and logits-from-state wiring are future Stage 6B/6C work.
+    """
+
+    def __init__(
+        self,
+        config: MambaStudentConfig | None = None,
+        off_config: OffTrajectoryConfig | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config or MambaStudentConfig()
+        self.off_config = off_config or OffTrajectoryConfig(
+            delta_perturb_eps=self.config.delta_perturb_eps,
+            noise_sigma=self.config.noise_sigma,
+        )
+        try:
+            self.mamba_ssm: ModuleType = importlib.import_module("mamba_ssm")
+        except ImportError as exc:
+            raise ImportError(
+                "mamba-ssm is required for RealMambaStudent. "
+                "Install it only when running real Mamba experiments."
+            ) from exc
+
+    def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> StudentOutput:
+        del input_ids, attention_mask
+        raise NotImplementedError(
+            "RealMambaStudent forward is a Stage 6A scaffold only. Real Mamba "
+            "hidden-state extraction, delta perturbation, and logits_from_state "
+            "wiring are future Stage 6B/6C work."
         )

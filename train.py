@@ -21,7 +21,13 @@ from data.dataset import MockTextDataset
 from losses.cdm_loss import csdm_loss
 from losses.kd_loss import build_topk_indices, kd_kl_loss
 from models.cdm_engine import OffTrajectoryConfig
-from models.student_mamba import MockStudentMamba, StudentOutput
+from models.student_mamba import (
+    MambaStudentConfig,
+    MockStudentMamba,
+    RealMambaStudent,
+    StudentMamba,
+    StudentOutput,
+)
 from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper, MockTeacherWrapper
 from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
@@ -84,6 +90,7 @@ class TrainConfig:
     teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     mock: MockConfig = field(default_factory=MockConfig)
+    mamba_student: MambaStudentConfig = field(default_factory=MambaStudentConfig)
     hf_teacher: HuggingFaceRuntimeConfig = field(default_factory=HuggingFaceRuntimeConfig)
 
 
@@ -93,8 +100,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mock", action="store_true", help="Run the mock-only Stage 3 scaffold.")
     parser.add_argument("--max_steps", type=int, default=2, help="Number of optimizer steps.")
     parser.add_argument("--teacher-type", choices=("mock", "hf"), default=None)
-    parser.add_argument("--student-type", choices=("mock",), default=None)
+    parser.add_argument("--student-type", choices=("mock", "mamba"), default=None)
     parser.add_argument("--teacher-model-name-or-path", default=None)
+    parser.add_argument("--student-model-name-or-path", default=None)
+    parser.add_argument("--student-vocab-size", type=int, default=None)
+    parser.add_argument("--student-hidden-size", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
@@ -152,7 +162,9 @@ def _nested_get(data: dict[str, Any], key: str, default: Any) -> Any:
 def _normalize_student_type(value: str) -> str:
     if value in {"mock", "mock_mamba"}:
         return "mock"
-    raise ValueError(f"Unsupported student_type {value!r}; expected 'mock'.")
+    if value in {"mamba", "real_mamba"}:
+        return "mamba"
+    raise ValueError(f"Unsupported student_type {value!r}; expected 'mock' or 'mamba'.")
 
 
 def _normalize_teacher_type(value: str) -> str:
@@ -175,6 +187,31 @@ def _parse_logit_cache_config(raw: dict[str, Any]) -> LogitCacheConfig:
         use_top_k=bool(_nested_get(raw, "use_top_k", LogitCacheConfig.use_top_k)),
         top_k=int(_nested_get(raw, "top_k", LogitCacheConfig.top_k)),
         overwrite=bool(_nested_get(raw, "overwrite", LogitCacheConfig.overwrite)),
+    )
+
+
+def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
+    return MambaStudentConfig(
+        model_name_or_path=_optional_str(raw.get("model_name_or_path")),
+        vocab_size=int(_nested_get(raw, "vocab_size", MambaStudentConfig.vocab_size)),
+        hidden_size=int(_nested_get(raw, "hidden_size", MambaStudentConfig.hidden_size)),
+        num_layers=(
+            None
+            if raw.get("num_layers") in (None, "")
+            else int(raw.get("num_layers", MambaStudentConfig.num_layers))
+        ),
+        state_size=(
+            None
+            if raw.get("state_size") in (None, "")
+            else int(raw.get("state_size", MambaStudentConfig.state_size))
+        ),
+        torch_dtype=str(_nested_get(raw, "torch_dtype", MambaStudentConfig.torch_dtype)),
+        device=_optional_str(raw.get("device", MambaStudentConfig.device)),
+        trust_remote_code=bool(_nested_get(raw, "trust_remote_code", MambaStudentConfig.trust_remote_code)),
+        use_pretrained=bool(_nested_get(raw, "use_pretrained", MambaStudentConfig.use_pretrained)),
+        local_files_only=bool(_nested_get(raw, "local_files_only", MambaStudentConfig.local_files_only)),
+        delta_perturb_eps=float(_nested_get(raw, "delta_perturb_eps", MambaStudentConfig.delta_perturb_eps)),
+        noise_sigma=float(_nested_get(raw, "noise_sigma", MambaStudentConfig.noise_sigma)),
     )
 
 
@@ -232,6 +269,7 @@ def load_train_config(path: Path) -> TrainConfig:
         load_in_8bit=bool(hf_raw.get("load_in_8bit", HuggingFaceRuntimeConfig.load_in_8bit)),
         load_in_4bit=bool(hf_raw.get("load_in_4bit", HuggingFaceRuntimeConfig.load_in_4bit)),
     )
+    mamba_student = _parse_mamba_student_config(student_raw)
     return TrainConfig(
         seed=int(_nested_get(raw, "seed", TrainConfig.seed)),
         teacher_type=_normalize_teacher_type(str(teacher_raw.get("type", raw.get("teacher_type", "mock")))),
@@ -246,6 +284,7 @@ def load_train_config(path: Path) -> TrainConfig:
         teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
         loss=loss,
         mock=mock,
+        mamba_student=mamba_student,
         hf_teacher=hf_teacher,
     )
 
@@ -272,6 +311,16 @@ def _load_model_config_hf_defaults(config_path: Path) -> HuggingFaceRuntimeConfi
         load_in_8bit=bool(hf_raw.get("load_in_8bit", HuggingFaceRuntimeConfig.load_in_8bit)),
         load_in_4bit=bool(hf_raw.get("load_in_4bit", HuggingFaceRuntimeConfig.load_in_4bit)),
     )
+
+
+def _load_model_config_student_defaults(config_path: Path) -> MambaStudentConfig:
+    model_config_path = config_path.parent / "model_config.yaml"
+    if not model_config_path.exists():
+        return MambaStudentConfig()
+    with model_config_path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    student_raw = raw.get("student", {}) or {}
+    return _parse_mamba_student_config(student_raw)
 
 
 def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
@@ -312,17 +361,50 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             loss=replace(config.loss, ce_weight=0.2, kd_weight=1.0, csdm_weight=0.0),
         )
 
+    model_student = _load_model_config_student_defaults(args.config)
+    config = replace(
+        config,
+        mamba_student=replace(
+            config.mamba_student,
+            model_name_or_path=config.mamba_student.model_name_or_path or model_student.model_name_or_path,
+            vocab_size=config.mamba_student.vocab_size or model_student.vocab_size,
+            hidden_size=config.mamba_student.hidden_size or model_student.hidden_size,
+            num_layers=config.mamba_student.num_layers if config.mamba_student.num_layers is not None else model_student.num_layers,
+            state_size=config.mamba_student.state_size if config.mamba_student.state_size is not None else model_student.state_size,
+            torch_dtype=config.mamba_student.torch_dtype or model_student.torch_dtype,
+            device=config.mamba_student.device if config.mamba_student.device is not None else model_student.device,
+            trust_remote_code=config.mamba_student.trust_remote_code or model_student.trust_remote_code,
+            use_pretrained=config.mamba_student.use_pretrained or model_student.use_pretrained,
+            local_files_only=config.mamba_student.local_files_only or model_student.local_files_only,
+            delta_perturb_eps=config.mamba_student.delta_perturb_eps,
+            noise_sigma=config.mamba_student.noise_sigma,
+        ),
+    )
+
     if not args.mock and args.teacher_type is not None:
         config = replace(config, teacher_type=args.teacher_type)
     if not args.mock and args.student_type is not None:
-        config = replace(config, student_type=args.student_type)
+        config = replace(config, student_type=_normalize_student_type(args.student_type))
     if args.teacher_model_name_or_path is not None:
         config = replace(
             config,
             hf_teacher=replace(config.hf_teacher, model_name_or_path=args.teacher_model_name_or_path),
         )
+    if getattr(args, "student_model_name_or_path", None) is not None:
+        config = replace(
+            config,
+            mamba_student=replace(config.mamba_student, model_name_or_path=args.student_model_name_or_path),
+        )
+    if getattr(args, "student_vocab_size", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, vocab_size=args.student_vocab_size))
+    if getattr(args, "student_hidden_size", None) is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, hidden_size=args.student_hidden_size))
     if args.local_files_only:
-        config = replace(config, hf_teacher=replace(config.hf_teacher, local_files_only=True))
+        config = replace(
+            config,
+            hf_teacher=replace(config.hf_teacher, local_files_only=True),
+            mamba_student=replace(config.mamba_student, local_files_only=True),
+        )
     if args.seq_len is not None:
         config = replace(config, mock=replace(config.mock, seq_len=args.seq_len))
     if args.batch_size is not None:
@@ -555,6 +637,28 @@ def _build_teacher(config: TrainConfig, device: torch.device) -> MockTeacherWrap
     raise ValueError(f"Unsupported teacher_type {config.teacher_type!r}.")
 
 
+def _build_student(config: TrainConfig, teacher_vocab_size: int, device: torch.device) -> StudentMamba:
+    if config.student_type == "mock":
+        return MockStudentMamba(
+            vocab_size=teacher_vocab_size,
+            hidden_size=config.mock.hidden_size,
+            off_config=OffTrajectoryConfig(),
+        ).to(device)
+    if config.student_type == "mamba":
+        student_config = config.mamba_student
+        student = RealMambaStudent(
+            student_config,
+            off_config=OffTrajectoryConfig(
+                delta_perturb_eps=student_config.delta_perturb_eps,
+                noise_sigma=student_config.noise_sigma,
+            ),
+        )
+        if student_config.device is not None:
+            return student.to(torch.device(student_config.device))
+        return student.to(device)
+    raise ValueError(f"Unsupported student_type {config.student_type!r}.")
+
+
 def _teacher_cache_extra(config: TrainConfig, teacher_vocab_size: int) -> dict[str, Any]:
     extra: dict[str, Any] = {
         "teacher_type": config.teacher_type,
@@ -603,8 +707,6 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         raise ValueError("max_steps must be positive.")
     if config.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
-    if config.student_type != "mock":
-        raise ValueError("Only mock student training is implemented.")
     if config.teacher_cache.enabled and config.teacher_cache.use_top_k:
         raise NotImplementedError(
             "Top-k-only teacher logit cache entries cannot be used by train.py yet. "
@@ -629,11 +731,13 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     loader = DataLoader(dataset, batch_size=config.mock.batch_size, shuffle=False, drop_last=True)
     batches = infinite_loader(loader)
 
-    student = MockStudentMamba(
-        vocab_size=teacher_vocab_size,
-        hidden_size=config.mock.hidden_size,
-        off_config=OffTrajectoryConfig(),
-    ).to(device)
+    student = _build_student(config, teacher_vocab_size, device)
+    if config.student_type == "mamba":
+        raise NotImplementedError(
+            "RealMambaStudent training is a Stage 6A scaffold only. The real "
+            "student forward path for hidden-state extraction, delta "
+            "perturbation, and logits_from_state is future Stage 6B/6C work."
+        )
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
     logger = logger if logger is not None else ConsoleLogger()
     autocast_context = _autocast_context(config.mixed_precision, device)
@@ -702,7 +806,7 @@ def main() -> None:
     try:
         config = derive_runtime_config(args)
         run_training(config, max_steps=args.max_steps)
-    except ValueError as exc:
+    except (ImportError, NotImplementedError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
 

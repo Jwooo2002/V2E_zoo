@@ -5,18 +5,20 @@ Transformer-to-Mamba knowledge distillation. The current implementation is
 Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
 training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
 teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
-Stage 5C real-HF-teacher smoke training, and Stage 5D top-k KD/CSDM support
-with a mock student, plus Stage 5E teacher-cache integration in training:
+Stage 5C real-HF-teacher smoke training, Stage 5D top-k KD/CSDM support
+with a mock student, Stage 5E teacher-cache integration in training, and the
+Stage 6A optional real-Mamba student adapter scaffold:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
 
 No real Llama or Mamba modules are imported by default. The HuggingFace teacher
-wrapper imports `transformers` only when instantiated, so mock training and
-tests do not require Llama weights, HF login, external downloads, or
-`transformers`. The implemented losses operate on logits shaped `[B, T, V]` or
-`[B, N, V]`. The Stage 2 engine operates on mock student recurrent states
-shaped `[B, D]` or `[B, T, D]`.
+wrapper imports `transformers` only when instantiated, and
+`RealMambaStudent` imports `mamba_ssm` only when instantiated. Mock training and
+tests do not require Llama weights, HF login, external downloads,
+`transformers`, or `mamba-ssm`. The implemented losses operate on logits shaped
+`[B, T, V]` or `[B, N, V]`. The Stage 2 engine operates on mock student
+recurrent states shaped `[B, D]` or `[B, T, D]`.
 
 ## Implemented Files
 
@@ -34,7 +36,9 @@ shaped `[B, D]` or `[B, T, D]`.
 - `utils/logit_cache.py`: optional teacher-logit cache utility for clean
   token-prefix teacher outputs, with full-logit and top-k storage modes.
 - `models/student_mamba.py`: lightweight mock student that produces
-  on-trajectory logits, off-trajectory logits, and detached fake logits.
+  on-trajectory logits, off-trajectory logits, and detached fake logits, plus
+  an optional `RealMambaStudent` Stage 6A scaffold with lazy `mamba_ssm`
+  import and no private-internal assumptions.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
   shifted labels and `ignore_index` on the final placeholder token.
 - `train.py`: mock training plus an opt-in HuggingFace-teacher/mock-student
@@ -76,6 +80,35 @@ any Mamba state. The mock student's `h_delta_alt` is only a student-side
 surrogate used to exercise the off-trajectory engine; it is not real Mamba
 delta behavior. Fake logits are detached at the producer boundary before being
 passed to `csdm_loss`.
+
+## Stage 6A Real Mamba Student Adapter Scaffold
+
+`RealMambaStudent` is an opt-in scaffold for future real Mamba experiments.
+It does not import `mamba_ssm` at module import time, so mock tests and mock
+training remain dependency-free:
+
+```bash
+python -m compileall .
+pytest -q tests/test_mamba_adapter.py tests/test_train_smoke.py
+```
+
+Selecting the real Mamba student requires `mamba-ssm` only at instantiation:
+
+```bash
+python train.py --config configs/train_config.yaml \
+  --student-type mamba \
+  --student-model-name-or-path /path/to/local/mamba \
+  --local-files-only \
+  --max_steps 1
+```
+
+Stage 6A intentionally raises a clear `ImportError` if `mamba-ssm` is missing.
+If the dependency is present, `RealMambaStudent.forward` raises
+`NotImplementedError` because real Mamba hidden-state extraction,
+delta-controlled transition perturbation, and `logits_from_state` wiring are
+future Stage 6B/6C work. The teacher path is unchanged: the teacher consumes
+only clean `input_ids` and optional `attention_mask`, never student recurrent
+states.
 
 ## Stage 5D Top-k KD/CSDM
 
