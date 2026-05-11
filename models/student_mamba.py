@@ -41,6 +41,7 @@ class MambaStudentConfig:
     local_files_only: bool = False
     delta_perturb_eps: float = 0.10
     noise_sigma: float = 0.01
+    use_reference_forward: bool = False
 
 
 class StudentMamba(nn.Module, ABC):
@@ -159,11 +160,20 @@ class RealMambaStudent(StudentMamba):
         del attention_mask
 
         input_ids = input_ids.to(self._device)
-        with _mamba_cpu_reference_kernel_patch(self._device.type == "cpu"):
-            hidden = self.model.backbone(input_ids)
-            if isinstance(hidden, tuple):
-                hidden = hidden[0]
-            on_logits = self.model.lm_head(hidden)
+        try:
+            hidden, on_logits = self._forward_backbone_logits(
+                input_ids,
+                reference_causal_conv=self._device.type == "cpu" or self.config.use_reference_forward,
+                reference_selective_scan=self._device.type == "cpu" or self.config.use_reference_forward,
+            )
+        except (RuntimeError, TypeError) as exc:
+            if self._device.type != "cuda" or self.config.use_reference_forward or not _is_causal_conv1d_api_error(exc):
+                raise
+            hidden, on_logits = self._forward_backbone_logits(
+                input_ids,
+                reference_causal_conv=True,
+                reference_selective_scan=False,
+            )
         _validate_logits(on_logits, input_ids=input_ids, vocab_size=self.config.vocab_size)
 
         # Stage 6C smoke placeholder only. Real h'_t / h_delta_alt extraction is
@@ -181,6 +191,23 @@ class RealMambaStudent(StudentMamba):
             h_off=h_off,
             h_delta_alt=h_delta_alt,
         )
+
+    def _forward_backbone_logits(
+        self,
+        input_ids: Tensor,
+        *,
+        reference_causal_conv: bool,
+        reference_selective_scan: bool,
+    ) -> tuple[Tensor, Tensor]:
+        with _mamba_reference_kernel_patch(
+            reference_causal_conv=reference_causal_conv,
+            reference_selective_scan=reference_selective_scan,
+        ):
+            hidden = self.model.backbone(input_ids)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+            on_logits = self.model.lm_head(hidden)
+        return hidden, on_logits
 
     def _build_lm_head_model(self) -> nn.Module:
         lm_cls = _required_mamba_lm_head_model_class()
@@ -270,8 +297,8 @@ def _instantiate_mamba_config(config_cls: type[Any], config: MambaStudentConfig,
         "d_model": config.hidden_size,
         "n_layer": n_layer,
         "vocab_size": config.vocab_size,
-        "fused_add_norm": device.type == "cuda",
-        "rms_norm": device.type == "cuda",
+        "fused_add_norm": device.type == "cuda" and not config.use_reference_forward,
+        "rms_norm": device.type == "cuda" and not config.use_reference_forward,
         "pad_vocab_size_multiple": 1,
     }
     if config.state_size is not None:
@@ -279,35 +306,67 @@ def _instantiate_mamba_config(config_cls: type[Any], config: MambaStudentConfig,
     return config_cls(**kwargs)
 
 
+_MISSING_ATTR = object()
+
+
+def _is_causal_conv1d_api_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "causal_conv1d" in message and (
+        "incompatible function arguments" in message
+        or "invalid combination of arguments" in message
+        or "takes" in message
+        or "got an unexpected keyword argument" in message
+    )
+
+
 @contextmanager
-def _mamba_cpu_reference_kernel_patch(enabled: bool) -> Iterator[None]:
-    """Temporarily use public reference kernels for CPU-only smoke.
+def _mamba_reference_kernel_patch(*, reference_causal_conv: bool, reference_selective_scan: bool) -> Iterator[None]:
+    """Temporarily use public reference kernels for smoke forward.
 
     Some mamba-ssm builds expose CUDA-only causal-conv1d/selective-scan fast
-    paths even when tensors are on CPU. Stage 6C only needs an import/forward
-    smoke, so this temporarily switches the public module globals to CPU-capable
-    reference paths when mamba-ssm provides them.
+    paths even when tensors are on CPU, and some mamba-ssm / causal-conv1d
+    version pairs have incompatible fused CUDA signatures. Stage 6C only needs
+    an import/forward smoke, so this temporarily switches public module globals
+    to reference paths when mamba-ssm provides them.
     """
 
-    if not enabled:
+    if not reference_causal_conv and not reference_selective_scan:
         yield
         return
     try:
         mamba_simple = importlib.import_module("mamba_ssm.modules.mamba_simple")
-        selective_scan_interface = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
     except ImportError:
         yield
         return
-    original_selective_scan_fn = getattr(mamba_simple, "selective_scan_fn", None)
-    original_causal_conv1d_fn = getattr(mamba_simple, "causal_conv1d_fn", None)
-    if hasattr(selective_scan_interface, "selective_scan_ref"):
+    selective_scan_interface = None
+    if reference_selective_scan:
+        try:
+            selective_scan_interface = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
+        except ImportError:
+            selective_scan_interface = None
+    original_selective_scan_fn = (
+        getattr(mamba_simple, "selective_scan_fn") if hasattr(mamba_simple, "selective_scan_fn") else _MISSING_ATTR
+    )
+    original_causal_conv1d_fn = (
+        getattr(mamba_simple, "causal_conv1d_fn") if hasattr(mamba_simple, "causal_conv1d_fn") else _MISSING_ATTR
+    )
+    if selective_scan_interface is not None and hasattr(selective_scan_interface, "selective_scan_ref"):
         setattr(mamba_simple, "selective_scan_fn", selective_scan_interface.selective_scan_ref)
-    setattr(mamba_simple, "causal_conv1d_fn", None)
+    if reference_causal_conv:
+        setattr(mamba_simple, "causal_conv1d_fn", None)
     try:
         yield
     finally:
-        setattr(mamba_simple, "selective_scan_fn", original_selective_scan_fn)
-        setattr(mamba_simple, "causal_conv1d_fn", original_causal_conv1d_fn)
+        _restore_module_attr(mamba_simple, "selective_scan_fn", original_selective_scan_fn)
+        _restore_module_attr(mamba_simple, "causal_conv1d_fn", original_causal_conv1d_fn)
+
+
+def _restore_module_attr(module: ModuleType, name: str, value: object) -> None:
+    if value is _MISSING_ATTR:
+        if hasattr(module, name):
+            delattr(module, name)
+        return
+    setattr(module, name, value)
 
 
 def _validate_logits(logits: Tensor, input_ids: Tensor, vocab_size: int) -> None:

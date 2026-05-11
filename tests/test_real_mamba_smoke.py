@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -10,10 +11,19 @@ from pathlib import Path
 import pytest
 import torch
 
-from models.student_mamba import MambaStudentConfig, RealMambaStudent
+from models.student_mamba import MambaStudentConfig, RealMambaStudent, _mamba_reference_kernel_patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "cdm_mamba_forward_script_tests",
+    ROOT / "scripts" / "check_mamba_forward.py",
+)
+assert SCRIPT_SPEC is not None
+assert SCRIPT_SPEC.loader is not None
+check_mamba_forward = importlib.util.module_from_spec(SCRIPT_SPEC)
+sys.modules[SCRIPT_SPEC.name] = check_mamba_forward
+SCRIPT_SPEC.loader.exec_module(check_mamba_forward)
 
 
 def test_student_mamba_import_still_does_not_require_mamba_ssm() -> None:
@@ -146,6 +156,99 @@ def test_check_mamba_forward_script_supports_cpu() -> None:
     assert payload["on_logits_shape"] == [1, 4, 32]
     assert payload["off_logits_shape"] == [1, 4, 32]
     assert payload["fake_logits_shape"] == [1, 4, 32]
+    assert payload["reference_forward"] is True
+    assert payload["requested_reference_forward"] is False
+
+
+def test_check_mamba_forward_script_supports_reference_flag_cpu() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_mamba_forward.py",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--seq-len",
+            "4",
+            "--vocab-size",
+            "32",
+            "--hidden-size",
+            "16",
+            "--num-layers",
+            "1",
+            "--use-reference-forward",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    if not _mamba_available():
+        assert result.returncode != 0
+        return
+    if result.returncode != 0:
+        payload = json.loads(result.stderr)
+        pytest.skip(f"mamba_ssm CPU reference forward unsupported in this environment: {payload}")
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["reference_forward"] is True
+    assert payload["requested_reference_forward"] is True
+
+
+def test_check_mamba_forward_error_payload_is_compact_for_tensor_repr() -> None:
+    huge_tensor_repr = "causal_conv1d_fwd(): incompatible function arguments\nInvoked with: tensor([" + (
+        "1.2345, " * 500
+    ) + "])"
+    payload = check_mamba_forward._compact_error_payload(
+        TypeError(huge_tensor_repr),
+        device="cuda",
+        stage="causal_conv1d_cuda_fast_path",
+    )
+    dumped = json.dumps(payload)
+
+    assert payload["success"] is False
+    assert payload["error_type"] == "TypeError"
+    assert payload["stage"] == "causal_conv1d_cuda_fast_path"
+    assert "fused causal_conv1d fast path" in payload["probable_cause"]
+    assert "Invoked with" not in payload["error_message"]
+    assert "tensor([" not in payload["error_message"]
+    assert len(payload["error_message"]) <= 300
+    assert len(dumped) < 1200
+
+
+def test_mamba_reference_kernel_patch_restores_missing_attrs(monkeypatch: pytest.MonkeyPatch) -> None:
+    mamba_simple = types.ModuleType("mamba_ssm.modules.mamba_simple")
+    selective_scan_interface = types.ModuleType("mamba_ssm.ops.selective_scan_interface")
+
+    def selective_scan_ref() -> None:
+        return None
+
+    selective_scan_interface.selective_scan_ref = selective_scan_ref
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str, package: str | None = None) -> types.ModuleType:
+        if name == "mamba_ssm.modules.mamba_simple":
+            return mamba_simple
+        if name == "mamba_ssm.ops.selective_scan_interface":
+            return selective_scan_interface
+        return real_import_module(name, package)
+
+    monkeypatch.setattr("models.student_mamba.importlib.import_module", fake_import_module)
+
+    assert not hasattr(mamba_simple, "selective_scan_fn")
+    assert not hasattr(mamba_simple, "causal_conv1d_fn")
+    with pytest.raises(RuntimeError, match="inside patch"):
+        with _mamba_reference_kernel_patch(reference_causal_conv=True, reference_selective_scan=True):
+            assert mamba_simple.selective_scan_fn is selective_scan_ref
+            assert mamba_simple.causal_conv1d_fn is None
+            raise RuntimeError("inside patch")
+
+    assert not hasattr(mamba_simple, "selective_scan_fn")
+    assert not hasattr(mamba_simple, "causal_conv1d_fn")
 
 
 @pytest.mark.skipif(not _mamba_available(), reason="mamba_ssm is not installed")

@@ -115,6 +115,24 @@ builds expose CUDA-only fast paths; the Stage 6C adapter switches to public
 reference paths for CPU smoke when available, and otherwise the script exits
 nonzero with a JSON error.
 
+If CUDA forward fails with a fused `causal_conv1d_fwd` API/signature error,
+the adapter/script retries once with a smoke-only reference/non-fused
+causal-conv path. You can request that path directly:
+
+```bash
+python scripts/check_mamba_forward.py --device cuda --use-reference-forward
+```
+
+`mamba_ssm` import success does not guarantee fused CUDA forward compatibility.
+When smoke still fails, stderr is a compact parseable JSON object with
+truncated error text and tensor argument reprs omitted.
+For example, a `mamba-ssm` wheel and `causal-conv1d` wheel can expose
+incompatible CUDA extension signatures. Stage 6C treats CPU/reference smoke as
+sufficient evidence for import/instantiate/forward plumbing. Full CUDA fused
+Mamba training later requires a pinned compatible `mamba-ssm` +
+`causal-conv1d` wheel pair; do not downgrade or install random versions
+without pinning and validating the pair.
+
 When `mamba_ssm` is available, `RealMambaStudent` uses the public
 `MambaLMHeadModel` path. The smoke output is a `StudentOutput` with
 `on_logits`, `off_logits`, and detached `fake_logits` shaped `[B, T, V]`.
