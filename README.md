@@ -2,10 +2,11 @@
 
 This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
-Stage 1 plus Stage 2 mock-state engine pieces and the Stage 3 minimal mock
-training scaffold: configuration skeletons, KD/CSDM loss functions,
-off-trajectory student-state construction, mock teacher/student modules, and
-unit tests with mock tensors.
+Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
+training scaffold, and Stage 4 mock evaluation scaffolds: configuration
+skeletons, KD/CSDM loss functions, off-trajectory student-state construction,
+mock teacher/student modules, token-weighted evaluation metrics, and unit tests
+with mock tensors.
 
 No real Llama or Mamba modules are imported in the implemented stages. The
 implemented losses operate on logits shaped `[B, T, V]` or `[B, N, V]`. The
@@ -30,6 +31,13 @@ Stage 2 engine operates on mock student recurrent states shaped `[B, D]` or
 - `train.py`: mock-only training loop with gradient accumulation, CUDA bf16
   autocast when available, shared valid-position masking, and JSON console
   metrics.
+- `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
+- `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
+- `evals/perturbation_robustness.py`: token-weighted
+  `KL(teacher || student)` comparison for clean and off-trajectory student
+  logits.
+- `evals/needle.py`: deterministic synthetic Needle-in-a-Haystack metric
+  scaffold for mock mode only.
 - `configs/train_config.yaml`: minimal training/loss defaults for mock mode.
 - `configs/ds_config.json`: placeholder future DeepSpeed config; DeepSpeed is
   not a required dependency.
@@ -57,6 +65,26 @@ any Mamba state. The mock student's `h_delta_alt` is only a student-side
 surrogate used to exercise the off-trajectory engine; it is not real Mamba
 delta behavior. Fake logits are detached at the producer boundary before being
 passed to `csdm_loss`.
+
+## Stage 4 Mock Evaluation
+
+Run all mock evaluation scaffolds:
+
+```bash
+python evaluate.py --config configs/train_config.yaml --mock --mode all --max_batches 2
+```
+
+Individual modes are available with `--mode perplexity`, `--mode perturbation`,
+and `--mode needle`. Non-mock evaluation is intentionally not implemented yet,
+so the CLI exits clearly if `--mock` is omitted.
+
+Perplexity accumulates CE with `reduction="sum"` over the same valid-position
+mask used by training, then divides by the number of valid tokens. Perturbation
+robustness computes full-vocab mock-mode `KL(teacher || student)` for
+on-trajectory and off-trajectory student logits using the configured
+temperature. The teacher consumes only clean `input_ids`; it never consumes
+student states. The needle scaffold is deterministic synthetic bookkeeping only
+and should not be interpreted as real long-context reasoning evaluation.
 
 ## Stage 2 Off-State Engine
 
