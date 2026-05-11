@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from losses.kd_loss import gather_logits_by_indices
+
 
 def center_logits(x: Tensor) -> Tensor:
     """Subtract the vocab-dimension mean while preserving shape."""
@@ -53,11 +55,17 @@ def csdm_loss(
     scale_min: float = 0.05,
     scale_max: float = 5.0,
     eps: float = 1e-8,
+    topk_indices: Tensor | None = None,
+    renormalize_topk: bool = True,
 ) -> Tensor:
     """Compute the Stage 1 CSDM off-trajectory logit loss.
 
     The teacher and fake-student logits are detached internally. Only
-    ``off_logits`` receives gradients.
+    ``off_logits`` receives gradients. If ``topk_indices`` is provided, the
+    same selected vocab entries are used for off, teacher, and fake logits.
+    With ``renormalize_topk=True``, teacher/fake log-probabilities are
+    renormalized over selected K. With false, full-vocab log-probabilities are
+    gathered and the loss is summed over only selected terms.
     """
 
     _validate_csdm_logits(off_logits, teacher_logits, fake_logits, tau)
@@ -68,10 +76,24 @@ def csdm_loss(
     if eps <= 0:
         raise ValueError("eps must be positive.")
 
-    u = center_logits(off_logits / tau)
+    teacher_logits = teacher_logits.detach()
+    fake_logits = fake_logits.detach()
 
-    teacher_log_probs = F.log_softmax(teacher_logits.detach() / tau, dim=-1)
-    fake_log_probs = F.log_softmax(fake_logits.detach() / tau, dim=-1)
+    if topk_indices is not None:
+        off_selected = gather_logits_by_indices(off_logits, topk_indices)
+        if renormalize_topk:
+            teacher_selected = gather_logits_by_indices(teacher_logits, topk_indices)
+            fake_selected = gather_logits_by_indices(fake_logits, topk_indices)
+            teacher_log_probs = F.log_softmax(teacher_selected / tau, dim=-1)
+            fake_log_probs = F.log_softmax(fake_selected / tau, dim=-1)
+        else:
+            teacher_log_probs = gather_logits_by_indices(F.log_softmax(teacher_logits / tau, dim=-1), topk_indices)
+            fake_log_probs = gather_logits_by_indices(F.log_softmax(fake_logits / tau, dim=-1), topk_indices)
+        u = center_logits(off_selected / tau)
+    else:
+        u = center_logits(off_logits / tau)
+        teacher_log_probs = F.log_softmax(teacher_logits / tau, dim=-1)
+        fake_log_probs = F.log_softmax(fake_logits / tau, dim=-1)
     residual = center_logits(teacher_log_probs - fake_log_probs)
     residual = torch.clamp(residual, -residual_clip, residual_clip)
 

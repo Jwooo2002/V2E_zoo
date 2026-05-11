@@ -4,8 +4,9 @@ This repository implements Continuous-State Distribution Matching (CSDM) for
 Transformer-to-Mamba knowledge distillation. The current implementation is
 Stage 1 plus Stage 2 mock-state engine pieces, the Stage 3 minimal mock
 training scaffold, Stage 4 mock evaluation scaffolds, Stage 5A HuggingFace
-teacher wrapper integration, the Stage 5B teacher-logit cache scaffold, and
-the Stage 5C real-HF-teacher smoke training path with a mock student:
+teacher wrapper integration, the Stage 5B teacher-logit cache scaffold,
+Stage 5C real-HF-teacher smoke training, and Stage 5D top-k KD/CSDM support
+with a mock student:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -20,7 +21,8 @@ shaped `[B, D]` or `[B, T, D]`.
 ## Implemented Files
 
 - `losses/kd_loss.py`: temperature-scaled `KL(teacher || student)` in
-  logit space, with teacher logits detached internally.
+  logit space, with teacher logits detached internally and optional top-k
+  selected-vocab utilities.
 - `losses/cdm_loss.py`: centered-logit utilities and CSDM off-trajectory loss,
   with teacher and fake-student logits detached internally.
 - `models/cdm_engine.py`: delta-perturbation off-state engine for mock Mamba
@@ -73,6 +75,26 @@ any Mamba state. The mock student's `h_delta_alt` is only a student-side
 surrogate used to exercise the off-trajectory engine; it is not real Mamba
 delta behavior. Fake logits are detached at the producer boundary before being
 passed to `csdm_loss`.
+
+## Stage 5D Top-k KD/CSDM
+
+Top-k KD/CSDM is available but disabled by default. When enabled, `train.py`
+builds one shared selected-vocab index tensor from detached raw teacher logits,
+optionally appends valid next-token labels, and uses those same indices for
+teacher, on-trajectory student, off-trajectory student, and fake-student logits.
+CE remains full-vocab.
+
+The selected-vocab losses are approximations. With the default
+`renormalize_topk: true`, KD and CSDM renormalize over the selected K entries.
+Teacher logits still come only from clean token prefixes, and teacher/fake
+terms are detached inside the losses.
+
+Example mock run:
+
+```bash
+python train.py --config configs/train_config.yaml --mock --max_steps 2 \
+  --topk-enabled --top-k 256
+```
 
 ## Stage 5A HuggingFace Teacher Wrapper
 

@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from data.dataset import MockTextDataset
 from losses.cdm_loss import csdm_loss
-from losses.kd_loss import kd_kl_loss
+from losses.kd_loss import build_topk_indices, kd_kl_loss
 from models.cdm_engine import OffTrajectoryConfig
 from models.student_mamba import MockStudentMamba, StudentOutput
 from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper, MockTeacherWrapper
@@ -63,6 +63,14 @@ class HuggingFaceRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class TopKConfig:
+    enabled: bool = False
+    top_k: int = 256
+    include_labels: bool = True
+    renormalize_topk: bool = True
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     seed: int = 42
     teacher_type: str = "mock"
@@ -71,7 +79,7 @@ class TrainConfig:
     gradient_accumulation_steps: int = 16
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
-    top_k_kd: int | None = None
+    topk: TopKConfig = field(default_factory=TopKConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     mock: MockConfig = field(default_factory=MockConfig)
     hf_teacher: HuggingFaceRuntimeConfig = field(default_factory=HuggingFaceRuntimeConfig)
@@ -93,6 +101,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kd-weight", type=float, default=None)
     parser.add_argument("--ce-weight", type=float, default=None)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--topk-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable selected-vocab KD/CSDM approximation.",
+    )
+    parser.add_argument("--top-k", type=int, default=None, help="Number of teacher top-k logits to select.")
+    parser.add_argument(
+        "--topk-include-labels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Append valid target labels to teacher top-k indices.",
+    )
+    parser.add_argument(
+        "--topk-renormalize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Renormalize KD/CSDM distributions over selected vocab entries.",
+    )
     return parser.parse_args()
 
 
@@ -146,8 +173,16 @@ def load_train_config(path: Path) -> TrainConfig:
         ),
         ignore_index=int(_nested_get(mock_raw, "ignore_index", MockConfig.ignore_index)),
     )
-    top_k_raw = raw.get("top_k_kd")
-    top_k_kd = None if top_k_raw in (None, "") else int(top_k_raw)
+    topk_raw = raw.get("topk", {}) or {}
+    top_k_legacy = raw.get("top_k_kd")
+    topk_enabled_default = top_k_legacy not in (None, "") if "enabled" not in topk_raw else TopKConfig.enabled
+    top_k_default = int(top_k_legacy) if top_k_legacy not in (None, "") else TopKConfig.top_k
+    topk = TopKConfig(
+        enabled=bool(_nested_get(topk_raw, "enabled", topk_enabled_default)),
+        top_k=int(_nested_get(topk_raw, "top_k", top_k_default)),
+        include_labels=bool(_nested_get(topk_raw, "include_labels", TopKConfig.include_labels)),
+        renormalize_topk=bool(_nested_get(topk_raw, "renormalize_topk", TopKConfig.renormalize_topk)),
+    )
     hf_teacher = HuggingFaceRuntimeConfig(
         model_name_or_path=_optional_str(hf_raw.get("model_name_or_path")),
         torch_dtype=str(hf_raw.get("torch_dtype", HuggingFaceRuntimeConfig.torch_dtype)),
@@ -171,7 +206,7 @@ def load_train_config(path: Path) -> TrainConfig:
         ),
         learning_rate=float(_nested_get(raw, "learning_rate", TrainConfig.learning_rate)),
         max_grad_norm=float(_nested_get(raw, "max_grad_norm", TrainConfig.max_grad_norm)),
-        top_k_kd=top_k_kd,
+        topk=topk,
         loss=loss,
         mock=mock,
         hf_teacher=hf_teacher,
@@ -265,6 +300,14 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, loss=replace(config.loss, kd_weight=args.kd_weight))
     if args.csdm_weight is not None:
         config = replace(config, loss=replace(config.loss, csdm_weight=args.csdm_weight))
+    if getattr(args, "topk_enabled", None) is not None:
+        config = replace(config, topk=replace(config.topk, enabled=args.topk_enabled))
+    if getattr(args, "top_k", None) is not None:
+        config = replace(config, topk=replace(config.topk, top_k=args.top_k))
+    if getattr(args, "topk_include_labels", None) is not None:
+        config = replace(config, topk=replace(config.topk, include_labels=args.topk_include_labels))
+    if getattr(args, "topk_renormalize", None) is not None:
+        config = replace(config, topk=replace(config.topk, renormalize_topk=args.topk_renormalize))
     return config
 
 
@@ -311,14 +354,6 @@ def _select_shared_valid_mask(
     if not bool(valid_mask.any()):
         raise ValueError("batch has no valid next-token positions.")
     return valid_mask
-
-
-def _top_k_pair(student_logits: Tensor, teacher_logits: Tensor, top_k: int | None) -> tuple[Tensor, Tensor]:
-    if top_k is None or top_k <= 0 or top_k >= teacher_logits.shape[-1]:
-        return student_logits, teacher_logits
-    values, indices = teacher_logits.topk(top_k, dim=-1)
-    student_topk = student_logits.gather(dim=-1, index=indices)
-    return student_topk, values
 
 
 def _validate_teacher_student_logits(output: StudentOutput, teacher_logits: Tensor) -> None:
@@ -371,9 +406,24 @@ def compute_losses(
     off_masked = _masked_sequence_logits(output.off_logits, mask)
     teacher_masked = _masked_sequence_logits(teacher_logits, mask)
     fake_masked = _masked_sequence_logits(output.fake_logits, mask)
+    labels_masked = labels[mask].reshape(1, -1)
 
-    kd_student, kd_teacher = _top_k_pair(on_masked, teacher_masked, config.top_k_kd)
-    kd = kd_kl_loss(kd_student.float(), kd_teacher.float(), tau=config.loss.tau)
+    topk_indices = None
+    if config.topk.enabled:
+        topk_indices = build_topk_indices(
+            teacher_masked.float(),
+            labels=labels_masked,
+            top_k=config.topk.top_k,
+            include_labels=config.topk.include_labels,
+        )
+
+    kd = kd_kl_loss(
+        on_masked.float(),
+        teacher_masked.float(),
+        tau=config.loss.tau,
+        topk_indices=topk_indices,
+        renormalize_topk=config.topk.renormalize_topk,
+    )
     if config.loss.csdm_weight == 0:
         csdm = off_masked.new_zeros(())
     else:
@@ -386,6 +436,8 @@ def compute_losses(
             residual_clip=config.loss.residual_clip,
             scale_min=config.loss.scale_min,
             scale_max=config.loss.scale_max,
+            topk_indices=topk_indices,
+            renormalize_topk=config.topk.renormalize_topk,
         )
     total = (
         config.loss.ce_weight * ce

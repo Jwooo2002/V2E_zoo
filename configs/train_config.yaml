@@ -5,7 +5,12 @@ mixed_precision: bf16
 gradient_accumulation_steps: 16
 learning_rate: 1e-4
 max_grad_norm: 1.0
-top_k_kd:
+
+topk:
+  enabled: false
+  top_k: 256
+  include_labels: true
+  renormalize_topk: true
 
 teacher_cache:
   enabled: false
