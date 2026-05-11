@@ -35,6 +35,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use smoke-only reference/non-fused Mamba kernels when available.",
     )
+    parser.add_argument(
+        "--state-extraction",
+        choices=("last_hidden", "embedding", "none"),
+        default="last_hidden",
+        help="Student-side state scaffold to expose in the smoke output.",
+    )
+    parser.add_argument(
+        "--no-expose-states",
+        action="store_true",
+        help="Disable h/h_off/h_delta_alt exposure in the smoke output.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +121,8 @@ def _run_forward(args: argparse.Namespace, device: torch.device, *, use_referenc
         device=str(device),
         use_pretrained=False,
         use_reference_forward=use_reference_forward,
+        state_extraction=args.state_extraction,
+        expose_states=not args.no_expose_states,
     )
     student = RealMambaStudent(config).eval()
     input_ids = torch.randint(
@@ -128,11 +141,21 @@ def _run_forward(args: argparse.Namespace, device: torch.device, *, use_referenc
         "on_logits_shape": list(output.on_logits.shape),
         "off_logits_shape": list(output.off_logits.shape),
         "fake_logits_shape": list(output.fake_logits.shape),
+        "h_shape": _shape_or_none(output.h),
+        "h_off_shape": _shape_or_none(output.h_off),
+        "h_delta_alt_shape": _shape_or_none(output.h_delta_alt),
+        "state_extraction": config.state_extraction,
+        "expose_states": config.expose_states,
+        "smoke_placeholder_off_logits": output.off_logits.data_ptr() == output.on_logits.data_ptr(),
         "dtype": str(output.on_logits.dtype).replace("torch.", ""),
         "mamba_ssm_version": student.mamba_ssm_version,
         "reference_forward": use_reference_forward or device.type == "cpu",
         "requested_reference_forward": use_reference_forward,
     }
+
+
+def _shape_or_none(tensor: torch.Tensor | None) -> list[int] | None:
+    return None if tensor is None else list(tensor.shape)
 
 
 def main() -> int:

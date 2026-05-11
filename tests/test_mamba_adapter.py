@@ -57,6 +57,13 @@ def test_mamba_student_config_defaults() -> None:
     assert config.local_files_only is False
     assert config.delta_perturb_eps == pytest.approx(0.10)
     assert config.noise_sigma == pytest.approx(0.01)
+    assert config.state_extraction == "last_hidden"
+    assert config.expose_states is True
+
+
+def test_mamba_student_config_invalid_state_extraction_raises() -> None:
+    with pytest.raises(ValueError, match="Unsupported state_extraction"):
+        MambaStudentConfig(state_extraction="private")
 
 
 def test_real_mamba_student_missing_dependency_import_error(monkeypatch: pytest.MonkeyPatch) -> None:

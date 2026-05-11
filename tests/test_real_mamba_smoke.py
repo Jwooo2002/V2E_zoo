@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from models.student_mamba import MambaStudentConfig, RealMambaStudent, _mamba_reference_kernel_patch
+from models.student_mamba import MockStudentMamba, MambaStudentConfig, RealMambaStudent, _mamba_reference_kernel_patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +87,32 @@ def _mamba_available() -> bool:
     return True
 
 
+def test_mock_student_mamba_state_shapes_remain_available() -> None:
+    student = MockStudentMamba(vocab_size=29, hidden_size=11)
+    input_ids = torch.randint(0, 29, (2, 6), dtype=torch.long)
+
+    output = student(input_ids)
+
+    assert output.h is not None
+    assert output.h_off is not None
+    assert output.h_delta_alt is not None
+    assert output.h.shape == (2, 6, 11)
+    assert output.h_off.shape == output.h.shape
+    assert output.h_delta_alt.shape == output.h.shape
+
+
+@pytest.mark.parametrize("state_extraction", ["last_hidden", "embedding", "none"])
+def test_mamba_student_config_accepts_state_extraction_modes(state_extraction: str) -> None:
+    config = MambaStudentConfig(state_extraction=state_extraction)
+
+    assert config.state_extraction == state_extraction
+
+
+def test_mamba_student_config_rejects_invalid_state_extraction() -> None:
+    with pytest.raises(ValueError, match="Unsupported state_extraction"):
+        MambaStudentConfig(state_extraction="private_cache")
+
+
 @pytest.mark.skipif(not _mamba_available(), reason="mamba_ssm is not installed")
 def test_real_mamba_tiny_forward_shapes_cpu() -> None:
     config = MambaStudentConfig(
@@ -107,11 +133,65 @@ def test_real_mamba_tiny_forward_shapes_cpu() -> None:
     assert output.on_logits.shape == (2, 5, config.vocab_size)
     assert output.off_logits.shape == output.on_logits.shape
     assert output.fake_logits.shape == output.on_logits.shape
+    assert output.h is not None
+    assert output.h_off is not None
+    assert output.h_delta_alt is not None
     assert output.h.shape[:2] == input_ids.shape
     assert output.h_off.shape == output.h.shape
     assert output.h_delta_alt.shape == output.h.shape
     assert output.off_logits.data_ptr() == output.on_logits.data_ptr()
     assert not output.fake_logits.requires_grad
+
+
+@pytest.mark.skipif(not _mamba_available(), reason="mamba_ssm is not installed")
+@pytest.mark.parametrize("state_extraction", ["last_hidden", "embedding"])
+def test_real_mamba_tiny_forward_exposes_state_modes_cpu(state_extraction: str) -> None:
+    config = MambaStudentConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        torch_dtype="float32",
+        device="cpu",
+        state_extraction=state_extraction,
+    )
+    student = RealMambaStudent(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4), dtype=torch.long)
+
+    try:
+        with torch.no_grad():
+            output = student(input_ids)
+    except RuntimeError as exc:
+        pytest.skip(f"mamba_ssm CPU forward unsupported in this environment: {exc}")
+
+    assert output.h is not None
+    assert output.h.shape == (1, 4, config.hidden_size)
+    assert output.h_off is output.h
+    assert output.h_delta_alt is output.h
+
+
+@pytest.mark.skipif(not _mamba_available(), reason="mamba_ssm is not installed")
+def test_real_mamba_tiny_forward_can_disable_state_exposure_cpu() -> None:
+    config = MambaStudentConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        torch_dtype="float32",
+        device="cpu",
+        state_extraction="none",
+    )
+    student = RealMambaStudent(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4), dtype=torch.long)
+
+    try:
+        with torch.no_grad():
+            output = student(input_ids)
+    except RuntimeError as exc:
+        pytest.skip(f"mamba_ssm CPU forward unsupported in this environment: {exc}")
+
+    assert output.on_logits.shape == (1, 4, config.vocab_size)
+    assert output.h is None
+    assert output.h_off is None
+    assert output.h_delta_alt is None
 
 
 def test_check_mamba_forward_script_supports_cpu() -> None:
@@ -156,6 +236,12 @@ def test_check_mamba_forward_script_supports_cpu() -> None:
     assert payload["on_logits_shape"] == [1, 4, 32]
     assert payload["off_logits_shape"] == [1, 4, 32]
     assert payload["fake_logits_shape"] == [1, 4, 32]
+    assert payload["h_shape"] == [1, 4, 16]
+    assert payload["h_off_shape"] == [1, 4, 16]
+    assert payload["h_delta_alt_shape"] == [1, 4, 16]
+    assert payload["state_extraction"] == "last_hidden"
+    assert payload["expose_states"] is True
+    assert payload["smoke_placeholder_off_logits"] is True
     assert payload["reference_forward"] is True
     assert payload["requested_reference_forward"] is False
 
@@ -197,6 +283,94 @@ def test_check_mamba_forward_script_supports_reference_flag_cpu() -> None:
     assert payload["success"] is True
     assert payload["reference_forward"] is True
     assert payload["requested_reference_forward"] is True
+
+
+def test_check_mamba_forward_script_reports_null_state_shapes_for_none_mode() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_mamba_forward.py",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--seq-len",
+            "4",
+            "--vocab-size",
+            "32",
+            "--hidden-size",
+            "16",
+            "--num-layers",
+            "1",
+            "--state-extraction",
+            "none",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    if not _mamba_available():
+        assert result.returncode != 0
+        return
+    if result.returncode != 0:
+        payload = json.loads(result.stderr)
+        pytest.skip(f"mamba_ssm CPU forward unsupported in this environment: {payload}")
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["state_extraction"] == "none"
+    assert payload["h_shape"] is None
+    assert payload["h_off_shape"] is None
+    assert payload["h_delta_alt_shape"] is None
+    assert payload["smoke_placeholder_off_logits"] is True
+
+
+def test_check_mamba_forward_script_reports_null_state_shapes_when_exposure_disabled() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/check_mamba_forward.py",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--seq-len",
+            "4",
+            "--vocab-size",
+            "32",
+            "--hidden-size",
+            "16",
+            "--num-layers",
+            "1",
+            "--state-extraction",
+            "last_hidden",
+            "--no-expose-states",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    if not _mamba_available():
+        assert result.returncode != 0
+        return
+    if result.returncode != 0:
+        payload = json.loads(result.stderr)
+        pytest.skip(f"mamba_ssm CPU forward unsupported in this environment: {payload}")
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["state_extraction"] == "last_hidden"
+    assert payload["expose_states"] is False
+    assert payload["h_shape"] is None
+    assert payload["h_off_shape"] is None
+    assert payload["h_delta_alt_shape"] is None
+    assert payload["smoke_placeholder_off_logits"] is True
 
 
 def test_check_mamba_forward_error_payload_is_compact_for_tensor_repr() -> None:

@@ -20,9 +20,12 @@ class StudentOutput:
     on_logits: Tensor
     off_logits: Tensor
     fake_logits: Tensor
-    h: Tensor
-    h_off: Tensor
-    h_delta_alt: Tensor
+    h: Tensor | None
+    h_off: Tensor | None
+    h_delta_alt: Tensor | None
+
+
+_STATE_EXTRACTION_MODES = frozenset({"last_hidden", "embedding", "none"})
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,16 @@ class MambaStudentConfig:
     delta_perturb_eps: float = 0.10
     noise_sigma: float = 0.01
     use_reference_forward: bool = False
+    state_extraction: str = "last_hidden"
+    expose_states: bool = True
+
+    def __post_init__(self) -> None:
+        if self.state_extraction not in _STATE_EXTRACTION_MODES:
+            allowed = ", ".join(sorted(_STATE_EXTRACTION_MODES))
+            raise ValueError(
+                f"Unsupported state_extraction {self.state_extraction!r}; "
+                f"expected one of: {allowed}."
+            )
 
 
 class StudentMamba(nn.Module, ABC):
@@ -106,11 +119,13 @@ class MockStudentMamba(StudentMamba):
 
 
 class RealMambaStudent(StudentMamba):
-    """Opt-in real Mamba student adapter for Stage 6C forward smoke.
+    """Opt-in real Mamba student adapter for Stage 6C/6D smoke checks.
 
     This class imports ``mamba_ssm`` lazily and uses public Mamba classes only.
     Stage 6C verifies tiny model instantiation and logit-shape-compatible
-    forward output. It does not implement real ``h_delta_alt`` extraction,
+    forward output. Stage 6D exposes a student-side representation ``h`` using
+    either the public backbone output or a documented token-embedding fallback
+    for shape plumbing. It does not implement real ``h_delta_alt`` extraction,
     off-trajectory state construction, or CSDM training with real Mamba.
     ``off_logits`` mirrors ``on_logits`` as a smoke-only placeholder.
     """
@@ -176,11 +191,12 @@ class RealMambaStudent(StudentMamba):
             )
         _validate_logits(on_logits, input_ids=input_ids, vocab_size=self.config.vocab_size)
 
-        # Stage 6C smoke placeholder only. Real h'_t / h_delta_alt extraction is
-        # intentionally deferred to Stage 6D/6E.
-        h = hidden
-        h_off = hidden
-        h_delta_alt = hidden
+        # Stage 6D smoke scaffold only. Real h'_t / h_delta_alt extraction is
+        # intentionally deferred to Stage 6E; h_off and h_delta_alt mirror h
+        # only so downstream shape plumbing can be exercised explicitly.
+        h = self._extract_state(input_ids=input_ids, last_hidden=hidden)
+        h_off = h
+        h_delta_alt = h
         off_logits = on_logits
         fake_logits = on_logits.detach()
         return StudentOutput(
@@ -208,6 +224,38 @@ class RealMambaStudent(StudentMamba):
                 hidden = hidden[0]
             on_logits = self.model.lm_head(hidden)
         return hidden, on_logits
+
+    def _extract_state(self, *, input_ids: Tensor, last_hidden: Tensor) -> Tensor | None:
+        """Return the Stage 6D student-side state scaffold.
+
+        ``last_hidden`` is the preferred smoke representation because it is the
+        public Mamba backbone output used by the LM head. ``embedding`` is a
+        provisional fallback for shape plumbing only and is not claimed to be a
+        final recurrent Mamba state.
+        """
+
+        if not self.config.expose_states or self.config.state_extraction == "none":
+            return None
+        if self.config.state_extraction == "last_hidden":
+            return last_hidden
+        if self.config.state_extraction == "embedding":
+            return self._embedding_state(input_ids)
+        raise AssertionError(f"Unhandled state_extraction mode: {self.config.state_extraction!r}")
+
+    def _embedding_state(self, input_ids: Tensor) -> Tensor:
+        backbone = getattr(self.model, "backbone", None)
+        embedding = getattr(backbone, "embedding", None)
+        if embedding is None and hasattr(self.model, "get_input_embeddings"):
+            embedding = self.model.get_input_embeddings()
+        if embedding is None:
+            raise NotImplementedError(
+                "state_extraction='embedding' requires a public embedding module "
+                "on the Mamba model. It is a provisional Stage 6D fallback only."
+            )
+        state = embedding(input_ids)
+        if not isinstance(state, Tensor):
+            raise RuntimeError("Mamba embedding state extraction did not return a tensor.")
+        return state
 
     def _build_lm_head_model(self) -> nn.Module:
         lm_cls = _required_mamba_lm_head_model_class()
