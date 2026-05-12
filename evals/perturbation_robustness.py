@@ -255,6 +255,77 @@ def compute_perturbation_metrics(
     return metrics
 
 
+def compute_dual_perturbation_metrics(
+    teacher_logits: Tensor,
+    on_logits: Tensor,
+    off_logits: Tensor,
+    labels: Tensor | None = None,
+    mask: Tensor | None = None,
+    tau: float = 1.0,
+    top_k: int = 128,
+    include_labels: bool = True,
+    renormalize_topk: bool = True,
+    position_wise: bool = False,
+    include_position_metrics: bool | None = None,
+) -> dict[str, dict[str, float | int | bool | list[float] | list[int] | list[dict[str, float | int]]]]:
+    """Report perturbation KL on both full and selected teacher vocabularies.
+
+    ``full_vocab`` is the literal full-distribution ``KL(teacher || student)``.
+    ``topk`` is a selected-vocabulary diagnostic using indices built from the
+    detached clean-prefix teacher logits, optionally plus valid gold labels.
+    Both sections use the same mask and token weighting.
+    """
+
+    if top_k <= 0:
+        raise ValueError("top_k must be positive.")
+    _validate_logits_pair(teacher_logits, on_logits)
+    _validate_logits_pair(teacher_logits, off_logits)
+    valid_mask = _validate_mask(mask, teacher_logits.shape[:2])
+    if include_position_metrics is not None:
+        position_wise = include_position_metrics
+
+    full_vocab = compute_perturbation_metrics(
+        teacher_logits=teacher_logits,
+        on_logits=on_logits,
+        off_logits=off_logits,
+        mask=valid_mask,
+        tau=tau,
+        topk_indices=None,
+        renormalize_topk=renormalize_topk,
+        position_wise=position_wise,
+    )
+    topk_indices = build_topk_indices(
+        teacher_logits.detach().float(),
+        labels=labels,
+        top_k=top_k,
+        include_labels=include_labels,
+    )
+    topk = compute_perturbation_metrics(
+        teacher_logits=teacher_logits,
+        on_logits=on_logits,
+        off_logits=off_logits,
+        mask=valid_mask,
+        tau=tau,
+        topk_indices=topk_indices,
+        renormalize_topk=renormalize_topk,
+        position_wise=position_wise,
+    )
+    topk.update(
+        {
+            "top_k": top_k,
+            "include_labels": include_labels,
+            "renormalize_topk": renormalize_topk,
+            "selected_vocab_size": int(topk_indices.shape[-1]),
+        }
+    )
+    if int(full_vocab["num_tokens"]) != int(topk["num_tokens"]):
+        raise ValueError(
+            "full-vocab and top-k perturbation metrics must use the same token count, "
+            f"got {full_vocab['num_tokens']} and {topk['num_tokens']}."
+        )
+    return {"full_vocab": full_vocab, "topk": topk}
+
+
 def _merge_metrics(
     total: dict[str, float | int],
     batch_metrics: dict[str, float | int | list[float] | list[int] | list[dict[str, float | int]]],

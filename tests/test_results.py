@@ -28,6 +28,26 @@ def test_flatten_metrics_flattens_nested_dicts() -> None:
     }
 
 
+def test_flatten_metrics_preserves_dual_perturbation_names() -> None:
+    metrics = {
+        "full_vocab": {"delta_kl": 0.12},
+        "topk": {"delta_kl": 0.03},
+        "by_mode": {
+            "delta_projection": {
+                "full_vocab": {"kl_on": 0.1},
+                "topk": {"kl_on": 0.04},
+            }
+        },
+    }
+
+    flattened = flatten_metrics(metrics)
+
+    assert flattened["full_vocab.delta_kl"] == 0.12
+    assert flattened["topk.delta_kl"] == 0.03
+    assert flattened["by_mode.delta_projection.full_vocab.kl_on"] == 0.1
+    assert flattened["by_mode.delta_projection.topk.kl_on"] == 0.04
+
+
 def test_load_ablation_summary_parses_stage8a_records(tmp_path: Path) -> None:
     path = tmp_path / "ablation_summary.json"
     path.write_text(

@@ -119,6 +119,13 @@ def test_run_registered_experiment_executes_mock_smoke_under_run_dir(tmp_path: P
     assert eval_metrics["metadata"]["checkpoint_step"] == 1
     assert perturbation_metrics["metadata"]["student_checkpoint"] == str(checkpoint_path)
     assert perturbation_metrics["metadata"]["checkpoint_step"] == 1
+    assert perturbation_metrics["metadata"]["checkpoint_loaded"] is True
+    assert "full_vocab" in perturbation_metrics
+    assert "topk" in perturbation_metrics
+    assert "full_vocab" in perturbation_metrics["by_mode"]["delta_projection"]
+    assert "topk" in perturbation_metrics["by_mode"]["delta_projection"]
+    assert perturbation_metrics["metadata"]["student_checkpoint"] == str(checkpoint_path)
+    assert perturbation_metrics["summary"]["checkpoint_loaded"] is True
     assert str(run_dir / "checkpoints") in " ".join(manifest["command"])
     assert str(run_dir / "cache" / "teacher_logits") in " ".join(manifest["command"])
 

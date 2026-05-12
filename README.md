@@ -16,9 +16,9 @@ alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
 small-experiment runner support, Stage 7E distributed 2x4090 preparation,
 Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
 perturbation robustness benchmarking, Stage 8D synthetic
-Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, and Stage
-9A tiny real pilot configs, plus Stage 9B checkpoint-backed registered
-evaluation:
+Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, Stage 9A
+tiny real pilot configs, Stage 9B checkpoint-backed registered evaluation,
+and Stage 9C dual full-vocab/top-k perturbation reporting:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -929,6 +929,44 @@ Evaluation JSON includes metadata such as `student_checkpoint`,
 `student_type`, `checkpoint_loaded`, `checkpoint_step`, and
 `checkpoint_optimizer_step` so reports can distinguish fresh mock scaffolds
 from trained-checkpoint evaluation.
+
+## Stage 9C Dual Perturbation Evaluation
+
+Stage 9C reports perturbation robustness in two vocabularies without changing
+training math:
+
+- `full_vocab.delta_kl`: the broad full-distribution degradation,
+  `KL(teacher || student_off) - KL(teacher || student_on)`.
+- `topk.delta_kl`: the selected-vocabulary degradation on teacher top-k
+  indices, optionally including valid gold labels.
+
+The legacy `summary.kl_on`, `summary.kl_off`, and `summary.delta_kl` fields
+remain full-vocab metrics for backward compatibility. Top-k metrics are
+reported separately because renormalized selected-vocab KL is a diagnostic
+aligned with top-k KD/CSDM training, not the same quantity as full-vocab KL.
+
+```bash
+python scripts/run_perturbation_benchmark.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max-batches 2 \
+  --dual-report \
+  --top-k 128 \
+  --output-json /tmp/csdm_perturb_dual.json \
+  --output-csv /tmp/csdm_perturb_dual.csv
+```
+
+Registered experiments pass `--dual-report` to perturbation evaluation by
+default and, when a checkpoint exists, evaluate the loaded trained student:
+
+```bash
+python scripts/run_tiny_pilot.py \
+  --variant csdm_topk \
+  --base-output-dir /tmp/csdm_tiny_pilot_dual \
+  --max-steps 100 \
+  --with-perturbation \
+  --with-report
+```
 
 ## Stage 6B Mamba Dependency Diagnostics
 

@@ -173,6 +173,7 @@ def _perturbation_command(
         str(experiment_config.get("config", "configs/train_config.yaml")),
         "--max-batches",
         "2",
+        "--dual-report",
         "--output-json",
         str(run_dir / "evals" / "perturbation.json"),
         "--output-csv",

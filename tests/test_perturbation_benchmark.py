@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from evals.perturbation_robustness import (
+    compute_dual_perturbation_metrics,
     compute_perturbation_metrics,
     kl_teacher_student,
 )
@@ -91,6 +92,56 @@ def test_compute_perturbation_metrics_and_position_wise_output() -> None:
     assert math.isfinite(float(metrics["delta_kl"]))
 
 
+def test_dual_perturbation_metrics_report_full_vocab_and_topk() -> None:
+    teacher = torch.tensor([[[8.0, 3.0, -2.0, -3.0], [0.0, 8.0, 3.0, -3.0]]])
+    on = torch.tensor([[[8.0, 3.0, -2.0, -3.0], [0.0, 8.0, 3.0, -3.0]]])
+    off = torch.tensor([[[8.0, -3.0, 3.0, -2.0], [0.0, 8.0, -3.0, 3.0]]])
+    labels = torch.tensor([[2, -100]])
+    mask = torch.tensor([[True, False]])
+
+    dual = compute_dual_perturbation_metrics(
+        teacher,
+        on,
+        off,
+        labels=labels,
+        mask=mask,
+        top_k=1,
+        include_labels=True,
+    )
+    legacy = compute_perturbation_metrics(teacher, on, off, mask=mask)
+
+    assert set(dual) == {"full_vocab", "topk"}
+    assert dual["full_vocab"]["num_tokens"] == 1
+    assert dual["topk"]["num_tokens"] == 1
+    assert dual["topk"]["top_k"] == 1
+    assert dual["topk"]["include_labels"] is True
+    assert math.isclose(float(dual["full_vocab"]["delta_kl"]), float(legacy["delta_kl"]), rel_tol=1e-6)
+    assert math.isfinite(float(dual["topk"]["delta_kl"]))
+    assert not math.isclose(float(dual["full_vocab"]["delta_kl"]), float(dual["topk"]["delta_kl"]), abs_tol=1e-8)
+
+
+def test_dual_perturbation_topk_handles_ignored_labels() -> None:
+    teacher = torch.randn(2, 3, 7)
+    on = teacher + 0.01 * torch.randn(2, 3, 7)
+    off = teacher + 0.03 * torch.randn(2, 3, 7)
+    labels = torch.tensor([[1, -100, 3], [2, 4, -100]])
+    mask = labels.ne(-100)
+
+    metrics = compute_dual_perturbation_metrics(
+        teacher,
+        on,
+        off,
+        labels=labels,
+        mask=mask,
+        top_k=3,
+        include_labels=True,
+    )
+
+    assert metrics["full_vocab"]["num_tokens"] == int(mask.sum())
+    assert metrics["topk"]["num_tokens"] == int(mask.sum())
+    assert math.isfinite(float(metrics["topk"]["kl_on"]))
+
+
 def _run_benchmark(*args: str) -> dict[str, object]:
     result = subprocess.run(
         [sys.executable, "scripts/run_perturbation_benchmark.py", *args],
@@ -127,14 +178,27 @@ def _mock_student_checkpoint(tmp_path: Path) -> Path:
 
 
 def test_perturbation_benchmark_cli_mock_json() -> None:
-    payload = _run_benchmark("--config", "configs/train_config.yaml", "--mock", "--max-batches", "2")
+    payload = _run_benchmark(
+        "--config",
+        "configs/train_config.yaml",
+        "--mock",
+        "--max-batches",
+        "2",
+        "--top-k",
+        "8",
+    )
 
-    assert set(payload) == {"summary", "by_mode", "position_wise", "metadata"}
+    assert set(payload) == {"summary", "full_vocab", "topk", "by_mode", "position_wise", "metadata"}
     assert "delta_projection" in payload["by_mode"]
     summary = payload["summary"]
     for key in ("kl_on", "kl_off", "delta_kl"):
         assert math.isfinite(float(summary[key]))
     assert int(summary["num_tokens"]) > 0
+    assert payload["full_vocab"]["delta_kl"] == summary["delta_kl"]
+    assert math.isfinite(float(payload["topk"]["delta_kl"]))
+    assert payload["topk"]["top_k"] == 8
+    assert "full_vocab" in payload["by_mode"]["delta_projection"]
+    assert "topk" in payload["by_mode"]["delta_projection"]
 
 
 def test_perturbation_benchmark_loads_student_checkpoint_and_reports_metadata(tmp_path: Path) -> None:
@@ -159,6 +223,8 @@ def test_perturbation_benchmark_loads_student_checkpoint_and_reports_metadata(tm
     assert metadata["checkpoint_student_type"] == "mock"
     assert payload["summary"]["checkpoint_loaded"] is True
     assert payload["summary"]["checkpoint_step"] == 9
+    assert "full_vocab" in payload
+    assert "topk" in payload
 
 
 def test_perturbation_benchmark_loads_mock_student_checkpoint(tmp_path: Path) -> None:
@@ -201,12 +267,21 @@ def test_perturbation_benchmark_writes_json_csv_and_sweeps(tmp_path: Path) -> No
     assert output_json.is_file()
     assert output_csv.is_file()
     assert set(payload["by_mode"]) == {"delta_projection", "noise", "identity"}
+    for mode_summary in payload["by_mode"].values():
+        assert "full_vocab" in mode_summary
+        assert "topk" in mode_summary
     assert len(payload["position_wise"]["delta_kl"]) > 0
     saved = json.loads(output_json.read_text(encoding="utf-8"))
     assert saved["metadata"]["modes"] == ["delta_projection", "noise", "identity"]
     with output_csv.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["mode"] for row in rows] == ["delta_projection", "noise", "identity"]
+    assert "full_vocab.kl_on" in rows[0]
+    assert "full_vocab.delta_kl" in rows[0]
+    assert "topk.kl_on" in rows[0]
+    assert "topk.delta_kl" in rows[0]
+    assert "topk.top_k" in rows[0]
+    assert "checkpoint_loaded" in rows[0]
 
 
 def test_perturbation_benchmark_mock_does_not_import_real_optional_modules() -> None:
@@ -283,9 +358,13 @@ def test_perturbation_benchmark_never_passes_student_states_to_teacher(monkeypat
         return teacher, student, dataloader, torch.device("cpu")
 
     monkeypatch.setattr(benchmark, "_build_components", fake_build_components)
-    args = benchmark.parse_args(["--config", "configs/train_config.yaml", "--mock", "--max-batches", "1"])
+    args = benchmark.parse_args(
+        ["--config", "configs/train_config.yaml", "--mock", "--max-batches", "1", "--top-k", "4"]
+    )
 
     summary, _positions, _checkpoint_state = benchmark._run_mode(args, "delta_projection")
 
     assert teacher.calls == 1
     assert int(summary["num_tokens"]) == 3
+    assert "full_vocab" in summary
+    assert "topk" in summary

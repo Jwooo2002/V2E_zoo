@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.vocab import get_tokenizer_vocab_size, validate_token_id_ranges
-from evals.perturbation_robustness import compute_perturbation_metrics
+from evals.perturbation_robustness import compute_dual_perturbation_metrics, compute_perturbation_metrics
 from losses.kd_loss import build_topk_indices
 from models.cdm_engine import OffTrajectoryConfig
 from models.student_mamba import MockStudentMamba
@@ -51,6 +51,17 @@ CSV_COLUMNS = (
     "num_batches",
     "topk_enabled",
     "top_k",
+    "full_vocab.kl_on",
+    "full_vocab.kl_off",
+    "full_vocab.delta_kl",
+    "full_vocab.num_tokens",
+    "topk.kl_on",
+    "topk.kl_off",
+    "topk.delta_kl",
+    "topk.num_tokens",
+    "topk.top_k",
+    "checkpoint_loaded",
+    "student_checkpoint",
 )
 
 
@@ -78,6 +89,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--topk-include-labels", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--topk-renormalize", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dual-report", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tau", type=float, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-csv", type=Path, default=None)
@@ -283,6 +295,27 @@ def _finalize_position_metrics(position_state: dict[str, list[float] | list[int]
     return {"kl_on": on_values, "kl_off": off_values, "delta_kl": delta_values}
 
 
+def _accumulate_metric_section(state: dict[str, float | int], metrics: dict[str, Any]) -> None:
+    num_tokens = int(metrics["num_tokens"])
+    state["num_tokens"] = int(state.get("num_tokens", 0)) + num_tokens
+    state["kl_on_sum"] = float(state.get("kl_on_sum", 0.0)) + float(metrics["kl_on"]) * num_tokens
+    state["kl_off_sum"] = float(state.get("kl_off_sum", 0.0)) + float(metrics["kl_off"]) * num_tokens
+
+
+def _finalize_metric_section(state: dict[str, float | int]) -> dict[str, float | int]:
+    num_tokens = int(state.get("num_tokens", 0))
+    if num_tokens <= 0:
+        raise ValueError("benchmark found no valid tokens.")
+    kl_on = float(state["kl_on_sum"]) / float(num_tokens)
+    kl_off = float(state["kl_off_sum"]) / float(num_tokens)
+    return {
+        "kl_on": kl_on,
+        "kl_off": kl_off,
+        "delta_kl": kl_off - kl_on,
+        "num_tokens": num_tokens,
+    }
+
+
 def _checkpoint_output_metadata(state: StudentCheckpointState | None, checkpoint_path: Path | None) -> dict[str, Any]:
     metadata = state.metadata if state is not None else {}
     return {
@@ -306,9 +339,8 @@ def _run_mode(
     checkpoint_state = None
     if args.student_checkpoint is not None:
         checkpoint_state = load_student_from_checkpoint(student, args.student_checkpoint, strict=True, map_location=device)
-    token_count = 0
-    kl_on_sum = 0.0
-    kl_off_sum = 0.0
+    full_vocab_state: dict[str, float | int] = {}
+    topk_state: dict[str, float | int] = {}
     num_batches = 0
     position_state: dict[str, list[float] | list[int]] = {}
 
@@ -339,46 +371,73 @@ def _run_mode(
                 ignore_index=config.vocab.ignored_label_id,
                 positions_per_sequence=config.mock.positions_per_sequence,
             )
-            topk_indices = None
-            if config.topk.enabled:
-                topk_indices = build_topk_indices(
-                    teacher_logits.detach().float(),
+            if args.dual_report:
+                batch_metrics = compute_dual_perturbation_metrics(
+                    teacher_logits=teacher_logits,
+                    on_logits=on_logits,
+                    off_logits=off_logits,
                     labels=labels,
+                    mask=mask,
+                    tau=config.loss.tau,
                     top_k=config.topk.top_k,
                     include_labels=config.topk.include_labels,
+                    renormalize_topk=config.topk.renormalize_topk,
+                    position_wise=args.position_wise,
                 )
-            metrics = compute_perturbation_metrics(
-                teacher_logits=teacher_logits,
-                on_logits=on_logits,
-                off_logits=off_logits,
-                mask=mask,
-                tau=config.loss.tau,
-                topk_indices=topk_indices,
-                renormalize_topk=config.topk.renormalize_topk,
-                position_wise=args.position_wise,
-            )
-            batch_tokens = int(metrics["num_tokens"])
-            token_count += batch_tokens
-            kl_on_sum += float(metrics["kl_on"]) * batch_tokens
-            kl_off_sum += float(metrics["kl_off"]) * batch_tokens
+                _accumulate_metric_section(full_vocab_state, batch_metrics["full_vocab"])
+                _accumulate_metric_section(topk_state, batch_metrics["topk"])
+                if args.position_wise:
+                    position_state = _accumulate_position_metrics(position_state, batch_metrics["full_vocab"])
+            else:
+                topk_indices = None
+                if config.topk.enabled:
+                    topk_indices = build_topk_indices(
+                        teacher_logits.detach().float(),
+                        labels=labels,
+                        top_k=config.topk.top_k,
+                        include_labels=config.topk.include_labels,
+                    )
+                metrics = compute_perturbation_metrics(
+                    teacher_logits=teacher_logits,
+                    on_logits=on_logits,
+                    off_logits=off_logits,
+                    mask=mask,
+                    tau=config.loss.tau,
+                    topk_indices=topk_indices,
+                    renormalize_topk=config.topk.renormalize_topk,
+                    position_wise=args.position_wise,
+                )
+                _accumulate_metric_section(full_vocab_state, metrics)
+                if args.position_wise:
+                    position_state = _accumulate_position_metrics(position_state, metrics)
             num_batches += 1
-            if args.position_wise:
-                position_state = _accumulate_position_metrics(position_state, metrics)
 
-    if token_count <= 0:
-        raise ValueError("benchmark found no valid tokens.")
+    full_vocab = _finalize_metric_section(full_vocab_state)
+    topk: dict[str, Any] | None = None
+    if args.dual_report:
+        topk = _finalize_metric_section(topk_state)
+        topk.update(
+            {
+                "top_k": config.topk.top_k,
+                "include_labels": config.topk.include_labels,
+                "renormalize_topk": config.topk.renormalize_topk,
+            }
+        )
     summary = {
-        "kl_on": kl_on_sum / float(token_count),
-        "kl_off": kl_off_sum / float(token_count),
-        "delta_kl": (kl_off_sum - kl_on_sum) / float(token_count),
-        "num_tokens": token_count,
+        "kl_on": full_vocab["kl_on"],
+        "kl_off": full_vocab["kl_off"],
+        "delta_kl": full_vocab["delta_kl"],
+        "num_tokens": full_vocab["num_tokens"],
         "num_batches": num_batches,
         "topk_enabled": config.topk.enabled,
         "top_k": config.topk.top_k if config.topk.enabled else None,
         "checkpoint_loaded": checkpoint_state is not None,
         "checkpoint_step": None if checkpoint_state is None else checkpoint_state.step,
         "checkpoint_optimizer_step": None if checkpoint_state is None else checkpoint_state.optimizer_step,
+        "full_vocab": full_vocab,
     }
+    if topk is not None:
+        summary["topk"] = topk
     return summary, _finalize_position_metrics(position_state), checkpoint_state
 
 
@@ -391,7 +450,10 @@ def _write_outputs(payload: dict[str, Any], args: argparse.Namespace) -> None:
         with args.output_csv.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(CSV_COLUMNS))
             writer.writeheader()
+            metadata = payload.get("metadata", {})
             for mode, summary in payload["by_mode"].items():
+                full_vocab = summary.get("full_vocab") or {}
+                topk = summary.get("topk") or {}
                 writer.writerow(
                     {
                         "mode": mode,
@@ -402,6 +464,17 @@ def _write_outputs(payload: dict[str, Any], args: argparse.Namespace) -> None:
                         "num_batches": summary["num_batches"],
                         "topk_enabled": summary["topk_enabled"],
                         "top_k": "" if summary["top_k"] is None else summary["top_k"],
+                        "full_vocab.kl_on": full_vocab.get("kl_on", ""),
+                        "full_vocab.kl_off": full_vocab.get("kl_off", ""),
+                        "full_vocab.delta_kl": full_vocab.get("delta_kl", ""),
+                        "full_vocab.num_tokens": full_vocab.get("num_tokens", ""),
+                        "topk.kl_on": topk.get("kl_on", ""),
+                        "topk.kl_off": topk.get("kl_off", ""),
+                        "topk.delta_kl": topk.get("delta_kl", ""),
+                        "topk.num_tokens": topk.get("num_tokens", ""),
+                        "topk.top_k": topk.get("top_k", ""),
+                        "checkpoint_loaded": metadata.get("checkpoint_loaded", ""),
+                        "student_checkpoint": metadata.get("student_checkpoint", ""),
                     }
                 )
 
@@ -422,8 +495,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             position_wise = positions
     first_mode = modes[0]
     config = _runtime_config(args, mode=first_mode)
+    first_summary = by_mode[first_mode]
     return {
-        "summary": by_mode[first_mode],
+        "summary": first_summary,
+        "full_vocab": first_summary["full_vocab"],
+        "topk": first_summary.get("topk", {}),
         "by_mode": by_mode,
         "position_wise": position_wise,
         "metadata": {
@@ -432,7 +508,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "dataset_type": config.data.dataset_type,
             "seq_len": config.mock.seq_len if config.data.dataset_type == "mock" else config.data.seq_len,
             "topk_enabled": config.topk.enabled,
-            "top_k": config.topk.top_k if config.topk.enabled else None,
+            "top_k": config.topk.top_k if args.dual_report or config.topk.enabled else None,
+            "dual_report": args.dual_report,
             "tau": config.loss.tau,
             "modes": modes,
             **_checkpoint_output_metadata(first_checkpoint_state, args.student_checkpoint),
