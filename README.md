@@ -17,7 +17,8 @@ small-experiment runner support, Stage 7E distributed 2x4090 preparation,
 Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
 perturbation robustness benchmarking, Stage 8D synthetic
 Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, and Stage
-9A tiny real pilot configs:
+9A tiny real pilot configs, plus Stage 9B checkpoint-backed registered
+evaluation:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -100,7 +101,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   mock student or `RealMambaStudent`, with gradient accumulation, CUDA-only
   autocast, optional full-logit teacher caching, shared valid-position masking,
   JSON console metrics, and rank-aware launch scaffolding.
-- `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
+- `evaluate.py`: evaluation CLI with mock defaults and optional
+  checkpoint-backed student loading for perplexity, perturbation, and scaffold
+  Needle outputs.
 - `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
 - `evals/perturbation_robustness.py`: token-weighted
   `KL(teacher || student)` comparison for clean and off-trajectory student
@@ -876,6 +879,56 @@ python scripts/run_tiny_pilot.py \
 The runner delegates to `scripts/run_registered_experiment.py`, so each pilot
 gets a run directory with `manifest.json`, copied configs, logs, checkpoints,
 teacher-cache outputs, optional eval artifacts, and reports.
+
+## Stage 9B Checkpoint-Backed Evaluation
+
+Stage 9B wires evaluation tools to trained student checkpoints from registered
+runs. This is evaluation wiring only: training losses, teacher behavior, and
+Mamba internals are unchanged. The teacher is still reconstructed from config
+and consumes only clean `input_ids` plus optional `attention_mask`; only the
+student parameters are loaded from the checkpoint.
+
+Evaluate a mock trained student checkpoint explicitly:
+
+```bash
+python evaluate.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --mode all \
+  --student-checkpoint /path/to/checkpoint.pt
+```
+
+Run perturbation robustness on the same checkpoint:
+
+```bash
+python scripts/run_perturbation_benchmark.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max-batches 2 \
+  --student-checkpoint /path/to/checkpoint.pt
+```
+
+Registered runs now pass the latest checkpoint from the run's configured
+`checkpoint_output_dir` to `evaluate.py` and the perturbation benchmark when
+`--with-eval` or `--with-perturbation` is used. Disable this with
+`--no-eval-trained-checkpoint`. Needle remains a scaffold/oracle benchmark
+unless real generation is implemented.
+
+Example registered pilot:
+
+```bash
+python scripts/run_tiny_pilot.py \
+  --variant csdm_topk \
+  --base-output-dir /tmp/csdm_tiny_pilot \
+  --max-steps 20 \
+  --with-perturbation \
+  --with-report
+```
+
+Evaluation JSON includes metadata such as `student_checkpoint`,
+`student_type`, `checkpoint_loaded`, `checkpoint_step`, and
+`checkpoint_optimizer_step` so reports can distinguish fresh mock scaffolds
+from trained-checkpoint evaluation.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

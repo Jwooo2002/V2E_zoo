@@ -31,6 +31,7 @@ from utils.manifest import (  # noqa: E402
     get_git_info,
     write_manifest,
 )
+from utils.checkpointing import latest_checkpoint  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -46,6 +47,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--with-perturbation", action="store_true")
     parser.add_argument("--with-needle", action="store_true")
     parser.add_argument("--with-report", action="store_true")
+    parser.add_argument(
+        "--eval-trained-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass the latest run checkpoint to evaluation commands when one exists.",
+    )
     return parser.parse_args(argv)
 
 
@@ -77,34 +84,93 @@ def _experiment_config(args: argparse.Namespace, run_dir: Path) -> dict[str, Any
     return load_experiment(args.experiment, overrides)
 
 
-def _safe_eval_command(run_dir: Path, experiment_config: dict[str, Any]) -> list[str] | None:
-    if experiment_config.get("teacher_type", "mock") != "mock":
+def _latest_eval_checkpoint(
+    args: argparse.Namespace,
+    run_dir: Path,
+    experiment_config: dict[str, Any],
+) -> Path | None:
+    if not args.eval_trained_checkpoint:
         return None
-    if experiment_config.get("student_type", "mock") != "mock":
-        return None
-    if experiment_config.get("dataset_type", "mock") != "mock":
+    checkpoint_dir = Path(str(experiment_config.get("checkpoint_output_dir", run_dir / "checkpoints")))
+    return latest_checkpoint(checkpoint_dir)
+
+
+def _is_mock_experiment(experiment_config: dict[str, Any]) -> bool:
+    return (
+        bool(experiment_config.get("mock"))
+        or (
+            experiment_config.get("teacher_type", "mock") == "mock"
+            and experiment_config.get("student_type", "mock") == "mock"
+            and experiment_config.get("dataset_type", "mock") == "mock"
+        )
+    )
+
+
+def _append_common_eval_flags(command: list[str], experiment_config: dict[str, Any]) -> None:
+    key_to_flag = {
+        "teacher_type": "--teacher-type",
+        "student_type": "--student-type",
+        "teacher_model_name_or_path": "--teacher-model-name-or-path",
+        "student_model_name_or_path": "--student-model-name-or-path",
+        "tokenizer_name_or_path": "--tokenizer-name-or-path",
+        "dataset_type": "--dataset-type",
+        "data_path": "--data-path",
+        "student_vocab_size": "--student-vocab-size",
+        "seq_len": "--seq-len",
+        "batch_size": "--batch-size",
+        "student_hidden_size": "--student-hidden-size",
+        "student_num_layers": "--student-num-layers",
+        "mixed_precision": "--mixed-precision",
+        "top_k": "--top-k",
+    }
+    for key, flag in key_to_flag.items():
+        value = experiment_config.get(key)
+        if value is not None:
+            command.extend([flag, str(value)])
+    if experiment_config.get("local_files_only"):
+        command.append("--local-files-only")
+    if "topk_enabled" in experiment_config:
+        command.append("--topk-enabled" if experiment_config["topk_enabled"] else "--no-topk-enabled")
+
+
+def _eval_command(
+    run_dir: Path,
+    experiment_config: dict[str, Any],
+    checkpoint_path: Path | None,
+) -> list[str] | None:
+    if not _is_mock_experiment(experiment_config) and checkpoint_path is None:
         return None
     config_path = str(experiment_config.get("config", "configs/train_config.yaml"))
-    return [
+    command = [
         sys.executable,
         str(ROOT / "evaluate.py"),
         "--config",
         config_path,
-        "--mock",
         "--mode",
         "all",
         "--max_batches",
         "2",
     ]
+    if _is_mock_experiment(experiment_config):
+        command.append("--mock")
+    _append_common_eval_flags(command, experiment_config)
+    if checkpoint_path is not None:
+        command.extend(["--student-checkpoint", str(checkpoint_path)])
+    return command
 
 
-def _perturbation_command(run_dir: Path, experiment_config: dict[str, Any]) -> list[str]:
-    return [
+def _perturbation_command(
+    run_dir: Path,
+    experiment_config: dict[str, Any],
+    checkpoint_path: Path | None,
+) -> list[str] | None:
+    if not _is_mock_experiment(experiment_config) and checkpoint_path is None:
+        return None
+    command = [
         sys.executable,
         str(ROOT / "scripts" / "run_perturbation_benchmark.py"),
         "--config",
         str(experiment_config.get("config", "configs/train_config.yaml")),
-        "--mock",
         "--max-batches",
         "2",
         "--output-json",
@@ -112,6 +178,12 @@ def _perturbation_command(run_dir: Path, experiment_config: dict[str, Any]) -> l
         "--output-csv",
         str(run_dir / "evals" / "perturbation.csv"),
     ]
+    if _is_mock_experiment(experiment_config):
+        command.append("--mock")
+    _append_common_eval_flags(command, experiment_config)
+    if checkpoint_path is not None:
+        command.extend(["--student-checkpoint", str(checkpoint_path)])
+    return command
 
 
 def _needle_command(run_dir: Path) -> list[str]:
@@ -159,6 +231,7 @@ def _manifest(
     commands: list[list[str]],
     status: str,
     returncodes: dict[str, int | None],
+    eval_checkpoint: Path | None = None,
 ) -> RunManifest:
     git_info = get_git_info(ROOT)
     metadata: dict[str, Any] = {
@@ -167,6 +240,8 @@ def _manifest(
         "status": status,
         "returncodes": returncodes,
         "dry_run": bool(args.dry_run),
+        "eval_trained_checkpoint": bool(args.eval_trained_checkpoint),
+        "eval_checkpoint": None if eval_checkpoint is None else str(eval_checkpoint),
     }
     if git_info.is_dirty and not args.allow_dirty_git:
         metadata["warning"] = "git working tree is dirty"
@@ -211,8 +286,12 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
         if train_code != 0:
             status = "failed"
 
+    eval_checkpoint = (
+        None if args.dry_run or status != "success" else _latest_eval_checkpoint(args, run_dir, experiment_config)
+    )
+
     if not args.dry_run and status == "success" and args.with_eval:
-        eval_command = _safe_eval_command(run_dir, experiment_config)
+        eval_command = _eval_command(run_dir, experiment_config, eval_checkpoint)
         if eval_command is not None:
             commands.append(eval_command)
             eval_code = _run_command(
@@ -227,16 +306,19 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
             returncodes["eval"] = None
 
     if not args.dry_run and status == "success" and args.with_perturbation:
-        command = _perturbation_command(run_dir, experiment_config)
-        commands.append(command)
-        code = _run_command(
-            command,
-            stdout_path=run_dir / "logs" / "perturbation.stdout",
-            stderr_path=run_dir / "logs" / "perturbation.stderr",
-        )
-        returncodes["perturbation"] = code
-        if code != 0:
-            status = "failed"
+        command = _perturbation_command(run_dir, experiment_config, eval_checkpoint)
+        if command is not None:
+            commands.append(command)
+            code = _run_command(
+                command,
+                stdout_path=run_dir / "logs" / "perturbation.stdout",
+                stderr_path=run_dir / "logs" / "perturbation.stderr",
+            )
+            returncodes["perturbation"] = code
+            if code != 0:
+                status = "failed"
+        else:
+            returncodes["perturbation"] = None
 
     if not args.dry_run and status == "success" and args.with_needle:
         command = _needle_command(run_dir)
@@ -269,6 +351,7 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
         commands=commands,
         status=status,
         returncodes=returncodes,
+        eval_checkpoint=eval_checkpoint,
     )
     write_manifest(manifest, run_dir / "manifest.json")
     print(run_dir, flush=True)

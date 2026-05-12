@@ -38,6 +38,7 @@ from train import (
     load_train_config,
     set_seed,
 )
+from utils.checkpointing import StudentCheckpointState, load_student_from_checkpoint
 
 
 PERTURBATION_MODES = ("identity", "noise", "delta_projection", "placeholder")
@@ -59,14 +60,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mock", action="store_true", help="Use mock teacher/student/data without external models.")
     parser.add_argument("--teacher-type", choices=("mock", "hf"), default=None)
     parser.add_argument("--student-type", choices=("mock", "mamba"), default=None)
+    parser.add_argument("--student-checkpoint", type=Path, default=None)
     parser.add_argument("--teacher-model-name-or-path", default=None)
+    parser.add_argument("--student-model-name-or-path", default=None)
     parser.add_argument("--tokenizer-name-or-path", default=None)
     parser.add_argument("--dataset-type", choices=("mock", "text", "jsonl"), default=None)
     parser.add_argument("--data-path", default=None)
+    parser.add_argument("--student-vocab-size", type=int, default=None)
+    parser.add_argument("--student-hidden-size", type=int, default=None)
+    parser.add_argument("--student-num-layers", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-batches", "--max_batches", dest="max_batches", type=int, default=2)
     parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default=None)
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--topk-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--topk-include-labels", action=argparse.BooleanOptionalAction, default=None)
@@ -94,18 +101,40 @@ def _runtime_config(args: argparse.Namespace, *, mode: str) -> TrainConfig:
             config,
             hf_teacher=replace(config.hf_teacher, model_name_or_path=args.teacher_model_name_or_path),
         )
+    if args.student_model_name_or_path is not None:
+        config = replace(
+            config,
+            mamba_student=replace(config.mamba_student, model_name_or_path=args.student_model_name_or_path),
+        )
     if args.tokenizer_name_or_path is not None:
         config = replace(config, data=replace(config.data, tokenizer_name_or_path=args.tokenizer_name_or_path))
     if args.dataset_type is not None:
         config = replace(config, data=replace(config.data, dataset_type=args.dataset_type))
     if args.data_path is not None:
         config = replace(config, data=replace(config.data, path=args.data_path))
+    if args.student_vocab_size is not None:
+        config = replace(
+            config,
+            mamba_student=replace(config.mamba_student, vocab_size=args.student_vocab_size),
+            student_vocab_size_explicit=True,
+        )
+    if args.student_hidden_size is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, hidden_size=args.student_hidden_size))
+    if args.student_num_layers is not None:
+        config = replace(config, mamba_student=replace(config.mamba_student, num_layers=args.student_num_layers))
     if args.seq_len is not None:
         config = replace(config, mock=replace(config.mock, seq_len=args.seq_len), data=replace(config.data, seq_len=args.seq_len))
     if args.batch_size is not None:
         config = replace(config, mock=replace(config.mock, batch_size=args.batch_size))
     if args.mixed_precision is not None:
         config = replace(config, mixed_precision=args.mixed_precision)
+    if args.local_files_only:
+        config = replace(
+            config,
+            hf_teacher=replace(config.hf_teacher, local_files_only=True),
+            mamba_student=replace(config.mamba_student, local_files_only=True),
+            data=replace(config.data, local_files_only=True),
+        )
     if args.topk_enabled is not None:
         config = replace(config, topk=replace(config.topk, enabled=args.topk_enabled))
     if args.top_k is not None:
@@ -254,9 +283,29 @@ def _finalize_position_metrics(position_state: dict[str, list[float] | list[int]
     return {"kl_on": on_values, "kl_off": off_values, "delta_kl": delta_values}
 
 
-def _run_mode(args: argparse.Namespace, mode: str) -> tuple[dict[str, Any], dict[str, list[float]]]:
+def _checkpoint_output_metadata(state: StudentCheckpointState | None, checkpoint_path: Path | None) -> dict[str, Any]:
+    metadata = state.metadata if state is not None else {}
+    return {
+        "student_checkpoint": None if checkpoint_path is None else str(checkpoint_path),
+        "checkpoint_loaded": state is not None,
+        "checkpoint_step": None if state is None else state.step,
+        "checkpoint_optimizer_step": None if state is None else state.optimizer_step,
+        "checkpoint_project_stage": metadata.get("project_stage"),
+        "checkpoint_student_type": metadata.get("student_type"),
+        "checkpoint_student_vocab_size": metadata.get("student_vocab_size"),
+        "checkpoint_student_hidden_size": metadata.get("student_hidden_size"),
+    }
+
+
+def _run_mode(
+    args: argparse.Namespace,
+    mode: str,
+) -> tuple[dict[str, Any], dict[str, list[float]], StudentCheckpointState | None]:
     config = _runtime_config(args, mode=mode)
     teacher, student, dataloader, device = _build_components(config, mode=mode)
+    checkpoint_state = None
+    if args.student_checkpoint is not None:
+        checkpoint_state = load_student_from_checkpoint(student, args.student_checkpoint, strict=True, map_location=device)
     token_count = 0
     kl_on_sum = 0.0
     kl_off_sum = 0.0
@@ -326,8 +375,11 @@ def _run_mode(args: argparse.Namespace, mode: str) -> tuple[dict[str, Any], dict
         "num_batches": num_batches,
         "topk_enabled": config.topk.enabled,
         "top_k": config.topk.top_k if config.topk.enabled else None,
+        "checkpoint_loaded": checkpoint_state is not None,
+        "checkpoint_step": None if checkpoint_state is None else checkpoint_state.step,
+        "checkpoint_optimizer_step": None if checkpoint_state is None else checkpoint_state.optimizer_step,
     }
-    return summary, _finalize_position_metrics(position_state)
+    return summary, _finalize_position_metrics(position_state), checkpoint_state
 
 
 def _write_outputs(payload: dict[str, Any], args: argparse.Namespace) -> None:
@@ -360,9 +412,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     modes = _parse_modes(args)
     by_mode: dict[str, dict[str, Any]] = {}
     position_wise: dict[str, Any] = {}
+    first_checkpoint_state = None
     for mode in modes:
-        summary, positions = _run_mode(args, mode)
+        summary, positions, checkpoint_state = _run_mode(args, mode)
         by_mode[mode] = summary
+        if first_checkpoint_state is None:
+            first_checkpoint_state = checkpoint_state
         if args.position_wise and not position_wise:
             position_wise = positions
     first_mode = modes[0]
@@ -380,6 +435,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "top_k": config.topk.top_k if config.topk.enabled else None,
             "tau": config.loss.tau,
             "modes": modes,
+            **_checkpoint_output_metadata(first_checkpoint_state, args.student_checkpoint),
         },
     }
 

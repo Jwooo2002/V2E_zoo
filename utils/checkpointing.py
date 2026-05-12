@@ -25,6 +25,21 @@ class TrainingCheckpointState:
     rng_state: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class StudentCheckpointState:
+    path: Path
+    step: int | None
+    optimizer_step: int | None
+    metadata: dict[str, Any]
+    config: dict[str, Any] | None
+    missing_keys: tuple[str, ...]
+    unexpected_keys: tuple[str, ...]
+    student_state: dict[str, Any] | None = None
+    optimizer_state: dict[str, Any] | None = None
+    scheduler_state: dict[str, Any] | None = None
+    rng_state: dict[str, Any] | None = None
+
+
 def save_checkpoint(path: str | Path, state: dict[str, Any]) -> None:
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +51,40 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     if not isinstance(state, dict):
         raise TypeError(f"checkpoint must contain a dict, got {type(state).__name__}.")
     return state
+
+
+def load_student_checkpoint(
+    checkpoint_path: str | Path,
+    student: nn.Module,
+    *,
+    map_location: str | torch.device = "cpu",
+    strict: bool = True,
+) -> StudentCheckpointState:
+    """Load only student weights from a training checkpoint or plain state dict."""
+
+    path = Path(checkpoint_path)
+    payload = load_checkpoint(path, map_location=map_location)
+    student_state = _extract_student_state_dict(payload)
+    incompatible = student.load_state_dict(student_state, strict=strict)
+    metadata = payload.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise TypeError("student checkpoint metadata must be a dict.")
+    config = payload.get("config")
+    if config is not None and not isinstance(config, dict):
+        raise TypeError("student checkpoint config must be a dict when provided.")
+    return StudentCheckpointState(
+        path=path,
+        step=_optional_int(payload.get("step")),
+        optimizer_step=_optional_int(payload.get("optimizer_step", payload.get("step"))),
+        metadata=metadata,
+        config=config,
+        missing_keys=tuple(incompatible.missing_keys),
+        unexpected_keys=tuple(incompatible.unexpected_keys),
+        student_state=dict(student_state),
+        optimizer_state=None,
+        scheduler_state=None,
+        rng_state=None,
+    )
 
 
 def save_training_checkpoint(
@@ -134,6 +183,44 @@ def load_training_checkpoint(
         scheduler_state=scheduler_state,
         rng_state=payload.get("rng_state", {}),
     )
+
+
+def load_student_from_checkpoint(
+    student: nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    strict: bool = True,
+    map_location: str | torch.device = "cpu",
+) -> StudentCheckpointState:
+    """Load only student parameters from a training checkpoint for evaluation."""
+
+    return load_student_checkpoint(
+        checkpoint_path,
+        student,
+        map_location=map_location,
+        strict=strict,
+    )
+
+
+def _extract_student_state_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    student_state = payload.get("student_state_dict", payload.get("student_state"))
+    if student_state is not None:
+        if not isinstance(student_state, dict):
+            raise TypeError("student_state_dict must be a state-dict mapping.")
+        return dict(student_state)
+    if _is_plain_state_dict(payload):
+        return dict(payload)
+    raise KeyError("checkpoint is missing student_state_dict.")
+
+
+def _is_plain_state_dict(payload: dict[str, Any]) -> bool:
+    return bool(payload) and all(isinstance(value, torch.Tensor) for value in payload.values())
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:

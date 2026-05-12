@@ -108,6 +108,17 @@ def test_run_registered_experiment_executes_mock_smoke_under_run_dir(tmp_path: P
     assert (run_dir / "reports" / "report.json").is_file()
     assert (run_dir / "reports" / "report.csv").is_file()
     assert (run_dir / "reports" / "report.md").is_file()
+    checkpoint_path = run_dir / "checkpoints" / "checkpoint_step_1_opt_1.pt"
+    assert checkpoint_path.is_file()
+    assert manifest["metadata"]["eval_checkpoint"] == str(checkpoint_path)
+    eval_metrics = json.loads((run_dir / "evals" / "eval.json").read_text(encoding="utf-8"))
+    perturbation_metrics = json.loads((run_dir / "evals" / "perturbation.json").read_text(encoding="utf-8"))
+    assert eval_metrics["metadata"]["checkpoint_loaded"] is True
+    assert perturbation_metrics["metadata"]["checkpoint_loaded"] is True
+    assert eval_metrics["metadata"]["student_checkpoint"] == str(checkpoint_path)
+    assert eval_metrics["metadata"]["checkpoint_step"] == 1
+    assert perturbation_metrics["metadata"]["student_checkpoint"] == str(checkpoint_path)
+    assert perturbation_metrics["metadata"]["checkpoint_step"] == 1
     assert str(run_dir / "checkpoints") in " ".join(manifest["command"])
     assert str(run_dir / "cache" / "teacher_logits") in " ".join(manifest["command"])
 

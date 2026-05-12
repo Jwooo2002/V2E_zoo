@@ -7,6 +7,7 @@ from utils.checkpointing import (
     TrainingCheckpointState,
     latest_checkpoint,
     load_checkpoint,
+    load_student_from_checkpoint,
     load_training_checkpoint,
     save_checkpoint,
     save_training_checkpoint,
@@ -131,6 +132,31 @@ def test_load_training_checkpoint_can_skip_optimizer_restore(tmp_path) -> None:
     assert restored_optimizer.state_dict()["state"] == {}
     for original, restored in zip(student.parameters(), restored_student.parameters()):
         assert torch.equal(original, restored)
+
+
+def test_load_student_from_checkpoint_loads_only_student_state(tmp_path) -> None:
+    student, optimizer, _scheduler = _trained_components()
+    path = save_training_checkpoint(
+        tmp_path,
+        student=student,
+        optimizer=optimizer,
+        step=5,
+        optimizer_step=2,
+        config={"student_type": "mock"},
+        metadata={"teacher_type": "mock"},
+    )
+
+    restored_student = torch.nn.Linear(3, 2)
+    state = load_student_from_checkpoint(restored_student, path, map_location="cpu")
+
+    for original, restored in zip(student.parameters(), restored_student.parameters()):
+        assert torch.equal(original, restored)
+    assert state.step == 5
+    assert state.optimizer_step == 2
+    assert state.config == {"student_type": "mock"}
+    assert state.metadata == {"teacher_type": "mock"}
+    assert state.optimizer_state is None
+    assert state.rng_state is None
 
 
 def test_latest_checkpoint_returns_highest_step_then_optimizer_step(tmp_path) -> None:

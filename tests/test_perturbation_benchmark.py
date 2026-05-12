@@ -8,12 +8,16 @@ import sys
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 
 from evals.perturbation_robustness import (
     compute_perturbation_metrics,
     kl_teacher_student,
 )
 from losses.kd_loss import build_topk_indices
+from models.student_mamba import MockStudentMamba
+from train import load_train_config
+from utils.checkpointing import save_training_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +103,29 @@ def _run_benchmark(*args: str) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
+def _mock_student_checkpoint(tmp_path: Path) -> Path:
+    config = load_train_config(ROOT / "configs" / "train_config.yaml")
+    student = MockStudentMamba(config.mock.vocab_size, config.mock.hidden_size)
+    with torch.no_grad():
+        for parameter in student.parameters():
+            parameter.fill_(0.02)
+    return save_training_checkpoint(
+        tmp_path,
+        student,
+        optimizer=None,
+        step=9,
+        optimizer_step=4,
+        config={"student_type": "mock"},
+        metadata={
+            "project_stage": "9B-test",
+            "student_type": "mock",
+            "student_vocab_size": config.mock.vocab_size,
+            "student_hidden_size": config.mock.hidden_size,
+        },
+        rng_state=False,
+    )
+
+
 def test_perturbation_benchmark_cli_mock_json() -> None:
     payload = _run_benchmark("--config", "configs/train_config.yaml", "--mock", "--max-batches", "2")
 
@@ -108,6 +135,48 @@ def test_perturbation_benchmark_cli_mock_json() -> None:
     for key in ("kl_on", "kl_off", "delta_kl"):
         assert math.isfinite(float(summary[key]))
     assert int(summary["num_tokens"]) > 0
+
+
+def test_perturbation_benchmark_loads_student_checkpoint_and_reports_metadata(tmp_path: Path) -> None:
+    checkpoint_path = _mock_student_checkpoint(tmp_path)
+
+    payload = _run_benchmark(
+        "--config",
+        "configs/train_config.yaml",
+        "--mock",
+        "--max-batches",
+        "1",
+        "--student-checkpoint",
+        str(checkpoint_path),
+    )
+
+    metadata = payload["metadata"]
+    assert metadata["student_checkpoint"] == str(checkpoint_path)
+    assert metadata["checkpoint_loaded"] is True
+    assert metadata["checkpoint_step"] == 9
+    assert metadata["checkpoint_optimizer_step"] == 4
+    assert metadata["checkpoint_project_stage"] == "9B-test"
+    assert metadata["checkpoint_student_type"] == "mock"
+    assert payload["summary"]["checkpoint_loaded"] is True
+    assert payload["summary"]["checkpoint_step"] == 9
+
+
+def test_perturbation_benchmark_loads_mock_student_checkpoint(tmp_path: Path) -> None:
+    checkpoint = _mock_student_checkpoint(tmp_path)
+    payload = _run_benchmark(
+        "--config",
+        "configs/train_config.yaml",
+        "--mock",
+        "--max-batches",
+        "2",
+        "--student-checkpoint",
+        str(checkpoint),
+    )
+
+    assert payload["metadata"]["checkpoint_loaded"] is True
+    assert payload["metadata"]["student_checkpoint"] == str(checkpoint)
+    assert payload["summary"]["checkpoint_loaded"] is True
+    assert math.isfinite(float(payload["summary"]["delta_kl"]))
 
 
 def test_perturbation_benchmark_writes_json_csv_and_sweeps(tmp_path: Path) -> None:
@@ -177,3 +246,46 @@ module.main(['--config', 'configs/train_config.yaml', '--mock', '--max-batches',
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_perturbation_benchmark_never_passes_student_states_to_teacher(monkeypatch) -> None:
+    import scripts.run_perturbation_benchmark as benchmark
+
+    class TokenOnlyTeacher(torch.nn.Module):
+        vocab_size = 11
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, input_ids: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+            assert args == ()
+            assert set(kwargs) <= {"attention_mask"}
+            assert "h_t" not in kwargs
+            assert "h_off" not in kwargs
+            assert input_ids.ndim == 2
+            self.calls += 1
+            return torch.nn.functional.one_hot(input_ids, num_classes=self.vocab_size).float()
+
+    teacher = TokenOnlyTeacher()
+    student = MockStudentMamba(vocab_size=teacher.vocab_size, hidden_size=4)
+    dataloader = DataLoader(
+        [
+            {
+                "input_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+                "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+            }
+        ],
+        batch_size=1,
+    )
+
+    def fake_build_components(config, *, mode: str):
+        return teacher, student, dataloader, torch.device("cpu")
+
+    monkeypatch.setattr(benchmark, "_build_components", fake_build_components)
+    args = benchmark.parse_args(["--config", "configs/train_config.yaml", "--mock", "--max-batches", "1"])
+
+    summary, _positions, _checkpoint_state = benchmark._run_mode(args, "delta_projection")
+
+    assert teacher.calls == 1
+    assert int(summary["num_tokens"]) == 3
