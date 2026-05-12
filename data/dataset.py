@@ -340,9 +340,6 @@ def _resolve_pad_token_id(tokenizer: Any, config: TextDatasetConfig) -> int:
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is not None:
         return int(pad_token_id)
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None:
-        return int(eos_token_id)
     raise ValueError("A pad_token_id is required when examples are shorter than seq_len.")
 
 

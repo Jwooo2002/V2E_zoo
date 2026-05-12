@@ -30,6 +30,7 @@ student:
   delta_alt_mode: delta_projection
   off_logits_mode: lm_head
   off_state_detach_direction: true
+  allow_student_vocab_resize: false
   notes:
     - Real Mamba is optional and used only by explicit smoke checks or explicit student_type=mamba smoke training.
     - Mock training and tests do not require mamba-ssm.
@@ -64,9 +65,11 @@ hf_teacher_smoke_training:
     - Tests use a fake transformers module and do not download model weights.
 
 tokenizer_data:
-  stage: 7A
+  stage: 7B
   enabled_by_cli: true
   notes:
     - Real text/jsonl data is opt-in; mock data remains default.
     - HF teacher smoke should use the same tokenizer as the teacher model.
+    - Tokenizer, teacher logits, and student logits must share one vocab size by default.
+    - Pad-token strategies that add tokens require explicit model resizing in a later stage.
     - Tests use fake/local tokenizers and do not download model files.

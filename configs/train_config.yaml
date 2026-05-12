@@ -43,6 +43,12 @@ student:
   delta_alt_mode: delta_projection
   off_logits_mode: lm_head
   off_state_detach_direction: true
+  allow_student_vocab_resize: false
+
+vocab:
+  strict_alignment: true
+  allow_student_vocab_resize: false
+  ignored_label_id: -100
 
 topk:
   enabled: false
@@ -59,6 +65,16 @@ teacher_cache:
   use_top_k: false
   top_k: 256
   overwrite: false
+
+checkpoint:
+  output_dir: checkpoints
+  save_every_steps: 0
+  save_at_end: false
+  resume_from:
+  auto_resume: false
+  strict_resume: true
+  load_optimizer: true
+  load_rng_state: true
 
 loss:
   ce_weight: 0.2

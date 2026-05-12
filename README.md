@@ -10,8 +10,9 @@ with a mock student, Stage 5E teacher-cache integration in training,
 Stage 6A optional real-Mamba student adapter scaffold, Stage 6B Mamba
 dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 6D/6E student-side state and approximate off-trajectory scaffolding, and
-Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, and Stage 7A
-local tokenizer/text data smoke support:
+Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
+local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
+alignment hardening, and Stage 7C checkpoint/resume hardening:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -39,6 +40,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   masks, never Mamba states, and return token-prefix-aligned logits.
 - `utils/logit_cache.py`: optional teacher-logit cache utility for clean
   token-prefix teacher outputs, with full-logit and top-k storage modes.
+- `utils/checkpointing.py`: student/optimizer training checkpoint helpers with
+  config, metadata, step counters, and RNG state for resume.
 - `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
   checks for `mamba_ssm` and `causal-conv1d`.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
@@ -54,6 +57,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   attention masks, and invalid labels set to `ignore_index`.
 - `data/tokenizer.py`: lazy HuggingFace tokenizer loader for opt-in local text
   data, with configurable pad-token handling.
+- `data/vocab.py`: strict tokenizer/teacher/student vocab alignment and
+  token-id range checks for local text smoke training.
 - `train.py`: mock training plus opt-in HuggingFace-teacher smoke paths for a
   mock student or `RealMambaStudent`, with gradient accumulation, CUDA-only
   autocast, optional full-logit teacher caching, shared valid-position masking,
@@ -332,6 +337,98 @@ Label and mask convention:
 - `labels[t] = input_ids[t + 1]` when both positions are real tokens.
 - the final position and all padding-derived positions use `-100`.
 - CE, KD, and CSDM continue to use one shared valid-token mask from labels.
+
+## Stage 7B Tokenizer And Vocab Alignment
+
+Stage 7B keeps the loss math unchanged and adds fail-fast validation around the
+shared token support used by CE, KD, and CSDM.
+
+The training setup now checks:
+
+- tokenizer length, teacher-logit vocab size, and student-logit vocab size;
+- pad/eos token ids against the selected vocabulary;
+- per-batch `input_ids` and non-ignored labels are in `[0, vocab_size)`;
+- teacher, on-student, off-student, and fake-student logits still share shape.
+
+Strict alignment is enabled by default:
+
+```yaml
+vocab:
+  strict_alignment: true
+  allow_student_vocab_resize: false
+  ignored_label_id: -100
+```
+
+If a pad-token strategy adds a new token, the tokenizer length may no longer
+match the teacher or student embeddings. Stage 7B raises a clear error in that
+case instead of silently resizing, truncating, or remapping token ids. Use a
+tokenizer/model pair with matching vocabularies, or implement an explicit
+student resize path before enabling `allow_student_vocab_resize`.
+
+Matching tokenizer/teacher example:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --teacher-type hf \
+  --student-type mock \
+  --teacher-model-name-or-path sshleifer/tiny-gpt2 \
+  --tokenizer-name-or-path sshleifer/tiny-gpt2 \
+  --dataset-type text \
+  --data-path data/smoke.txt \
+  --max_steps 1 \
+  --seq-len 16 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --mixed-precision no \
+  --csdm-weight 0.0
+```
+
+## Stage 7C Checkpoint And Resume
+
+Stage 7C saves and restores training process state without changing CE/KD/CSDM
+math. The frozen teacher is not checkpointed by default; it is reconstructed
+from config and still consumes only clean `input_ids` plus `attention_mask`.
+
+What is saved:
+
+- student `state_dict`;
+- optimizer state and optional scheduler state;
+- `step` and `optimizer_step`;
+- config snapshot and compatibility metadata;
+- tokenizer/vocab metadata, including the vocab alignment report;
+- Python, Torch CPU, CUDA when available, and NumPy RNG state when available.
+
+`--max_steps` means total target optimizer steps. If a checkpoint was saved at
+optimizer step 2, resuming with `--max_steps 4` trains optimizer steps 3 and 4.
+The deterministic loader is advanced by completed micro-steps so mock resume
+continues from the same batch position.
+
+Strict resume is enabled by default. The resume path checks metadata such as
+teacher type/model, student type/vocab/hidden size, tokenizer identity,
+dataset type/path, sequence length, top-k settings, loss weights, learning
+rate, and gradient accumulation. Mismatches raise before training continues.
+
+Save a checkpoint:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max_steps 2 \
+  --checkpoint-output-dir /tmp/csdm_ckpt \
+  --save-at-end
+```
+
+Resume to a total target of four optimizer steps:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max_steps 4 \
+  --resume-from /tmp/csdm_ckpt/checkpoint_step_2_opt_2.pt
+```
 
 Mock teacher/student text smoke:
 

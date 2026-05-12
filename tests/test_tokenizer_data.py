@@ -95,6 +95,39 @@ def test_load_tokenizer_new_pad_strategy_adds_special_token(monkeypatch: pytest.
     assert tokenizer.pad_token_id == 99
 
 
+def test_pad_token_strategy_none_does_not_fall_back_to_eos_for_padding(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeTokenizer:
+        pad_token = None
+        pad_token_id = None
+        eos_token = "</s>"
+        eos_token_id = 2
+        padding_side = "right"
+        vocab_size = 8
+
+        def __len__(self) -> int:
+            return self.vocab_size
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return [3, 4]
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(_name: str, **_kwargs: object) -> FakeTokenizer:
+            return FakeTokenizer()
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=FakeAutoTokenizer))
+    tokenizer = load_tokenizer(TokenizerConfig(name_or_path="tiny-tokenizer", pad_token_strategy="none"))
+    path = tmp_path / "tiny.txt"
+    path.write_text("ab\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pad_token_id is required"):
+        TokenizedTextDataset(
+            TextDatasetConfig(path=path, seq_len=4, add_special_tokens=False),
+            tokenizer,
+        )
+
+
 def test_tokenized_text_dataset_builds_next_token_labels_and_attention_mask(tmp_path: Path) -> None:
     path = tmp_path / "tiny.txt"
     path.write_text("ab\nabc\n\n", encoding="utf-8")

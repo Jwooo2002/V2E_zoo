@@ -65,6 +65,7 @@ class MambaStudentConfig:
     delta_alt_mode: str = "delta_projection"
     off_logits_mode: str = "lm_head"
     off_state_detach_direction: bool = True
+    allow_student_vocab_resize: bool = False
 
     def __post_init__(self) -> None:
         _validate_mode("state_extraction", self.state_extraction, _STATE_EXTRACTION_MODES)
@@ -108,6 +109,10 @@ class MockStudentMamba(StudentMamba):
         self.delta_scale = delta_scale
         self.off_engine = DeltaPerturbationEngine(off_config)
 
+    @property
+    def vocab_size(self) -> int:
+        return int(self.embedding.num_embeddings)
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> StudentOutput:
         del attention_mask
         if input_ids.ndim != 2:
@@ -115,11 +120,21 @@ class MockStudentMamba(StudentMamba):
         embeddings = self.embedding(input_ids)
         h, _ = self.sequence(embeddings)
         on_logits = self.lm_head(h)
+        if on_logits.shape[-1] != self.vocab_size:
+            raise RuntimeError(
+                f"MockStudentMamba on_logits vocab size {on_logits.shape[-1]} "
+                f"does not match self.vocab_size {self.vocab_size}."
+            )
 
         h_delta_alt = h + self.delta_scale * torch.tanh(self.delta_perturb_proj(h))
         h_delta_alt = h_delta_alt.to(device=h.device, dtype=h.dtype)
         h_off = self.off_engine.make_off_state(h, h_delta_alt=h_delta_alt)
         off_logits = self.lm_head(h_off)
+        if off_logits.shape[-1] != self.vocab_size:
+            raise RuntimeError(
+                f"MockStudentMamba off_logits vocab size {off_logits.shape[-1]} "
+                f"does not match self.vocab_size {self.vocab_size}."
+            )
 
         with torch.no_grad():
             fake_logits = self.lm_head(h_off.detach()).detach()

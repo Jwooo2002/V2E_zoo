@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import math
 import random
 from pathlib import Path
@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from data.dataset import MockTextDataset, TextDatasetConfig, TokenizedTextDataset
 from data.tokenizer import TokenizerConfig, load_tokenizer
+from data.vocab import get_tokenizer_vocab_size, validate_token_id_ranges, validate_vocab_alignment
 from losses.cdm_loss import csdm_loss
 from losses.kd_loss import build_topk_indices, kd_kl_loss
 from models.cdm_engine import OffTrajectoryConfig
@@ -30,6 +31,7 @@ from models.student_mamba import (
     StudentOutput,
 )
 from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper, MockTeacherWrapper
+from utils.checkpointing import latest_checkpoint, load_checkpoint, load_training_checkpoint, save_training_checkpoint
 from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
 
@@ -76,6 +78,13 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class VocabConfig:
+    strict_alignment: bool = True
+    allow_student_vocab_resize: bool = False
+    ignored_label_id: int = -100
+
+
+@dataclass(frozen=True)
 class HuggingFaceRuntimeConfig:
     model_name_or_path: str | None = None
     torch_dtype: str = "bfloat16"
@@ -97,6 +106,18 @@ class TopKConfig:
 
 
 @dataclass(frozen=True)
+class CheckpointConfig:
+    output_dir: str = "checkpoints"
+    save_every_steps: int = 0
+    save_at_end: bool = False
+    resume_from: str | None = None
+    auto_resume: bool = False
+    strict_resume: bool = True
+    load_optimizer: bool = True
+    load_rng_state: bool = True
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     seed: int = 42
     teacher_type: str = "mock"
@@ -107,8 +128,10 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     topk: TopKConfig = field(default_factory=TopKConfig)
     teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    vocab: VocabConfig = field(default_factory=VocabConfig)
     mock: MockConfig = field(default_factory=MockConfig)
     mamba_student: MambaStudentConfig = field(default_factory=MambaStudentConfig)
     student_vocab_size_explicit: bool = False
@@ -128,6 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-name-or-path", default=None)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--text-field", default=None)
+    parser.add_argument(
+        "--allow-student-vocab-resize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Opt into explicit student vocab resizing paths when implemented. Disabled by default.",
+    )
     parser.add_argument("--student-model-name-or-path", default=None)
     parser.add_argument("--student-vocab-size", type=int, default=None)
     parser.add_argument("--student-hidden-size", type=int, default=None)
@@ -189,6 +218,14 @@ def parse_args() -> argparse.Namespace:
         help="Store top-k-only teacher cache entries. Training raises until this loss path is implemented.",
     )
     parser.add_argument("--teacher-cache-top-k", type=int, default=None)
+    parser.add_argument("--checkpoint-output-dir", type=str, default=None)
+    parser.add_argument("--save-every-steps", type=int, default=None)
+    parser.add_argument("--save-at-end", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--strict-resume", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--load-optimizer", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--load-rng-state", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
 
@@ -252,6 +289,29 @@ def _parse_data_config(raw: dict[str, Any]) -> DataConfig:
     )
 
 
+def _parse_vocab_config(raw: dict[str, Any]) -> VocabConfig:
+    return VocabConfig(
+        strict_alignment=bool(_nested_get(raw, "strict_alignment", VocabConfig.strict_alignment)),
+        allow_student_vocab_resize=bool(
+            _nested_get(raw, "allow_student_vocab_resize", VocabConfig.allow_student_vocab_resize)
+        ),
+        ignored_label_id=int(_nested_get(raw, "ignored_label_id", VocabConfig.ignored_label_id)),
+    )
+
+
+def _parse_checkpoint_config(raw: dict[str, Any]) -> CheckpointConfig:
+    return CheckpointConfig(
+        output_dir=str(_nested_get(raw, "output_dir", CheckpointConfig.output_dir)),
+        save_every_steps=int(_nested_get(raw, "save_every_steps", CheckpointConfig.save_every_steps)),
+        save_at_end=bool(_nested_get(raw, "save_at_end", CheckpointConfig.save_at_end)),
+        resume_from=_optional_str(raw.get("resume_from")),
+        auto_resume=bool(_nested_get(raw, "auto_resume", CheckpointConfig.auto_resume)),
+        strict_resume=bool(_nested_get(raw, "strict_resume", CheckpointConfig.strict_resume)),
+        load_optimizer=bool(_nested_get(raw, "load_optimizer", CheckpointConfig.load_optimizer)),
+        load_rng_state=bool(_nested_get(raw, "load_rng_state", CheckpointConfig.load_rng_state)),
+    )
+
+
 def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
     return MambaStudentConfig(
         model_name_or_path=_optional_str(raw.get("model_name_or_path")),
@@ -283,6 +343,9 @@ def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
         off_state_detach_direction=bool(
             _nested_get(raw, "off_state_detach_direction", MambaStudentConfig.off_state_detach_direction)
         ),
+        allow_student_vocab_resize=bool(
+            _nested_get(raw, "allow_student_vocab_resize", MambaStudentConfig.allow_student_vocab_resize)
+        ),
     )
 
 
@@ -293,10 +356,12 @@ def load_train_config(path: Path) -> TrainConfig:
     loss_raw = raw.get("loss", {})
     mock_raw = raw.get("mock", {})
     data_raw = raw.get("data", {})
+    vocab_raw = raw.get("vocab", {}) or {}
     teacher_raw = raw.get("teacher", {})
     student_raw = raw.get("student", {})
     hf_raw = raw.get("hf_teacher", raw.get("hf_teacher_example", {}))
     teacher_cache_raw = raw.get("teacher_cache", {}) or {}
+    checkpoint_raw = raw.get("checkpoint", {}) or {}
     loss = LossConfig(
         ce_weight=float(_nested_get(loss_raw, "ce_weight", LossConfig.ce_weight)),
         kd_weight=float(_nested_get(loss_raw, "kd_weight", LossConfig.kd_weight)),
@@ -328,6 +393,7 @@ def load_train_config(path: Path) -> TrainConfig:
         include_labels=bool(_nested_get(topk_raw, "include_labels", TopKConfig.include_labels)),
         renormalize_topk=bool(_nested_get(topk_raw, "renormalize_topk", TopKConfig.renormalize_topk)),
     )
+    checkpoint = _parse_checkpoint_config(checkpoint_raw)
     hf_teacher = HuggingFaceRuntimeConfig(
         model_name_or_path=_optional_str(hf_raw.get("model_name_or_path")),
         torch_dtype=str(hf_raw.get("torch_dtype", HuggingFaceRuntimeConfig.torch_dtype)),
@@ -343,6 +409,7 @@ def load_train_config(path: Path) -> TrainConfig:
     )
     mamba_student = _parse_mamba_student_config(student_raw)
     data = _parse_data_config(data_raw)
+    vocab = _parse_vocab_config(vocab_raw)
     return TrainConfig(
         seed=int(_nested_get(raw, "seed", TrainConfig.seed)),
         teacher_type=_normalize_teacher_type(str(teacher_raw.get("type", raw.get("teacher_type", "mock")))),
@@ -355,8 +422,10 @@ def load_train_config(path: Path) -> TrainConfig:
         max_grad_norm=float(_nested_get(raw, "max_grad_norm", TrainConfig.max_grad_norm)),
         topk=topk,
         teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
+        checkpoint=checkpoint,
         loss=loss,
         data=data,
+        vocab=vocab,
         mock=mock,
         mamba_student=mamba_student,
         hf_teacher=hf_teacher,
@@ -459,6 +528,9 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             delta_alt_mode=config.mamba_student.delta_alt_mode or model_student.delta_alt_mode,
             off_logits_mode=config.mamba_student.off_logits_mode or model_student.off_logits_mode,
             off_state_detach_direction=config.mamba_student.off_state_detach_direction,
+            allow_student_vocab_resize=(
+                config.mamba_student.allow_student_vocab_resize or model_student.allow_student_vocab_resize
+            ),
         ),
     )
 
@@ -481,6 +553,12 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, data=replace(config.data, max_examples=args.max_examples))
     if not args.mock and getattr(args, "text_field", None) is not None:
         config = replace(config, data=replace(config.data, text_field=args.text_field))
+    if getattr(args, "allow_student_vocab_resize", None) is not None:
+        config = replace(
+            config,
+            vocab=replace(config.vocab, allow_student_vocab_resize=args.allow_student_vocab_resize),
+            mamba_student=replace(config.mamba_student, allow_student_vocab_resize=args.allow_student_vocab_resize),
+        )
     if getattr(args, "student_model_name_or_path", None) is not None:
         config = replace(
             config,
@@ -554,6 +632,22 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, teacher_cache=replace(config.teacher_cache, use_top_k=args.teacher_cache_use_top_k))
     if getattr(args, "teacher_cache_top_k", None) is not None:
         config = replace(config, teacher_cache=replace(config.teacher_cache, top_k=args.teacher_cache_top_k))
+    if getattr(args, "checkpoint_output_dir", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, output_dir=args.checkpoint_output_dir))
+    if getattr(args, "save_every_steps", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, save_every_steps=args.save_every_steps))
+    if getattr(args, "save_at_end", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, save_at_end=args.save_at_end))
+    if getattr(args, "resume_from", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, resume_from=args.resume_from))
+    if getattr(args, "auto_resume", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, auto_resume=args.auto_resume))
+    if getattr(args, "strict_resume", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, strict_resume=args.strict_resume))
+    if getattr(args, "load_optimizer", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, load_optimizer=args.load_optimizer))
+    if getattr(args, "load_rng_state", None) is not None:
+        config = replace(config, checkpoint=replace(config.checkpoint, load_rng_state=args.load_rng_state))
     if config.student_type == "mamba" and config.teacher_type == "mock":
         config = replace(config, mock=replace(config.mock, vocab_size=config.mamba_student.vocab_size))
     if config.teacher_type == "hf" and config.data.dataset_type != "mock" and config.data.tokenizer_name_or_path is None:
@@ -645,12 +739,12 @@ def compute_losses(
     _validate_teacher_student_logits(output, teacher_logits)
     mask = _select_shared_valid_mask(
         labels=labels,
-        ignore_index=config.mock.ignore_index,
+        ignore_index=config.vocab.ignored_label_id,
         positions_per_sequence=config.mock.positions_per_sequence,
     )
     ce_logits = output.on_logits[mask]
     ce_labels = labels[mask]
-    ce = F.cross_entropy(ce_logits.float(), ce_labels, ignore_index=config.mock.ignore_index)
+    ce = F.cross_entropy(ce_logits.float(), ce_labels, ignore_index=config.vocab.ignored_label_id)
 
     on_masked = _masked_sequence_logits(output.on_logits, mask)
     off_masked = _masked_sequence_logits(output.off_logits, mask)
@@ -722,16 +816,6 @@ def _training_device(config: TrainConfig) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _tokenizer_vocab_size(tokenizer: Any) -> int:
-    try:
-        return int(len(tokenizer))
-    except TypeError:
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if vocab_size is None:
-            raise ValueError("Tokenizer must expose __len__ or vocab_size for smoke training.")
-        return int(vocab_size)
-
-
 def _load_training_tokenizer(config: TrainConfig) -> Any | None:
     if config.data.dataset_type == "mock":
         return None
@@ -762,7 +846,7 @@ def _build_training_dataset(
             seq_len=config.mock.seq_len,
             num_samples=config.mock.num_samples,
             seed=config.seed,
-            ignore_index=config.mock.ignore_index,
+            ignore_index=config.vocab.ignored_label_id,
         )
     if tokenizer is None:
         raise ValueError("Tokenizer is required for text/jsonl datasets.")
@@ -780,18 +864,13 @@ def _build_training_dataset(
             shuffle=config.data.shuffle,
             file_format=config.data.dataset_type,
             text_field=config.data.text_field,
-            ignore_index=config.mock.ignore_index,
+            ignore_index=config.vocab.ignored_label_id,
         ),
     )
 
 
 def _teacher_vocab_size(teacher: MockTeacherWrapper | HuggingFaceTeacherWrapper) -> int:
-    if isinstance(teacher, MockTeacherWrapper):
-        return int(teacher.embedding.num_embeddings)
-    vocab_size = getattr(getattr(teacher.model, "config", None), "vocab_size", None)
-    if vocab_size is None:
-        raise ValueError("HuggingFace teacher model config must expose vocab_size for smoke training.")
-    return int(vocab_size)
+    return int(teacher.vocab_size)
 
 
 def _build_teacher(config: TrainConfig, device: torch.device) -> MockTeacherWrapper | HuggingFaceTeacherWrapper:
@@ -859,15 +938,47 @@ def _effective_student_vocab_size(config: TrainConfig, teacher_vocab_size: int) 
     raise ValueError(f"Unsupported student_type {config.student_type!r}.")
 
 
-def _validate_teacher_student_vocab(config: TrainConfig, teacher_vocab_size: int) -> None:
+def _tokenizer_special_id(tokenizer: Any | None, name: str) -> int | None:
+    if tokenizer is None:
+        return None
+    value = getattr(tokenizer, name, None)
+    return None if value is None else int(value)
+
+
+def _validate_vocab_for_training(
+    config: TrainConfig,
+    *,
+    tokenizer_vocab_size: int | None,
+    teacher_vocab_size: int,
+    tokenizer: Any | None,
+) -> Any:
     student_vocab_size = _effective_student_vocab_size(config, teacher_vocab_size)
-    if student_vocab_size != teacher_vocab_size:
-        raise ValueError(
-            "teacher and student vocab sizes must match for smoke training before token generation: "
-            f"teacher={teacher_vocab_size}, student={student_vocab_size}. "
-            "For HF teacher + RealMambaStudent smoke, omit --student-vocab-size to align to the "
-            "teacher automatically, or provide an explicit matching value."
+    try:
+        return validate_vocab_alignment(
+            tokenizer_vocab_size=tokenizer_vocab_size,
+            teacher_vocab_size=teacher_vocab_size,
+            student_vocab_size=student_vocab_size,
+            pad_token_id=_tokenizer_special_id(tokenizer, "pad_token_id"),
+            eos_token_id=_tokenizer_special_id(tokenizer, "eos_token_id"),
+            strict=config.vocab.strict_alignment,
+            ignored_label_id=config.vocab.ignored_label_id,
         )
+    except ValueError as exc:
+        if config.vocab.allow_student_vocab_resize or config.mamba_student.allow_student_vocab_resize:
+            raise NotImplementedError(
+                "Student vocab resizing was requested but Stage 7B does not silently resize "
+                "student embeddings/projection heads. Rebuild the student with a matching vocab "
+                "or add an explicit resize implementation for the selected student type. "
+                f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}, student={student_vocab_size}."
+            ) from exc
+        raise ValueError(
+            "vocab sizes must match for smoke training before token generation: "
+            f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}, "
+            f"student={student_vocab_size}. "
+            "Use one tokenizer/model vocabulary, omit --student-vocab-size to align the "
+            "student automatically when supported, or enable an explicit resize path later. "
+            f"{exc}"
+        ) from exc
 
 
 def _teacher_cache_extra(config: TrainConfig, teacher_vocab_size: int) -> dict[str, Any]:
@@ -913,11 +1024,216 @@ def _teacher_logits_from_cache_entry(entry: LogitCacheEntry) -> Tensor:
     raise ValueError("Teacher logit cache entry contained neither full logits nor top-k tensors.")
 
 
+def _checkpoint_metadata(
+    config: TrainConfig,
+    *,
+    tokenizer_vocab_size: int | None,
+    teacher_vocab_size: int,
+    vocab_report: Any,
+) -> dict[str, Any]:
+    student_vocab_size = _effective_student_vocab_size(config, teacher_vocab_size)
+    return {
+        "project_stage": "7C",
+        "teacher_type": config.teacher_type,
+        "teacher_model_name_or_path": config.hf_teacher.model_name_or_path,
+        "teacher_vocab_size": teacher_vocab_size,
+        "student_type": config.student_type,
+        "student_vocab_size": student_vocab_size,
+        "student_hidden_size": config.mock.hidden_size if config.student_type == "mock" else config.mamba_student.hidden_size,
+        "student_num_layers": None if config.student_type == "mock" else config.mamba_student.num_layers,
+        "student_state_extraction": None if config.student_type == "mock" else config.mamba_student.state_extraction,
+        "off_state_mode": "projection" if config.student_type == "mock" else config.mamba_student.off_state_mode,
+        "delta_alt_mode": "delta_projection" if config.student_type == "mock" else config.mamba_student.delta_alt_mode,
+        "off_logits_mode": "lm_head" if config.student_type == "mock" else config.mamba_student.off_logits_mode,
+        "off_state_detach_direction": None
+        if config.student_type == "mock"
+        else config.mamba_student.off_state_detach_direction,
+        "tokenizer_name_or_path": config.data.tokenizer_name_or_path,
+        "tokenizer_vocab_size": tokenizer_vocab_size,
+        "dataset_type": config.data.dataset_type,
+        "data_path": config.data.path,
+        "seq_len": config.mock.seq_len if config.data.dataset_type == "mock" else config.data.seq_len,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "mixed_precision": config.mixed_precision,
+        "learning_rate": config.learning_rate,
+        "max_grad_norm": config.max_grad_norm,
+        "topk_enabled": config.topk.enabled,
+        "top_k": config.topk.top_k,
+        "topk_renormalize": config.topk.renormalize_topk,
+        "teacher_cache_enabled": config.teacher_cache.enabled,
+        "csdm_weight": config.loss.csdm_weight,
+        "kd_weight": config.loss.kd_weight,
+        "ce_weight": config.loss.ce_weight,
+        "tau": config.loss.tau,
+        "vocab_alignment": asdict(vocab_report) if hasattr(vocab_report, "__dataclass_fields__") else vocab_report,
+    }
+
+
+def _resolve_resume_checkpoint(config: TrainConfig) -> Path | None:
+    if config.checkpoint.resume_from:
+        return Path(config.checkpoint.resume_from)
+    if config.checkpoint.auto_resume:
+        return latest_checkpoint(config.checkpoint.output_dir)
+    return None
+
+
+def _validate_resume_metadata(
+    checkpoint_metadata: dict[str, Any],
+    expected_metadata: dict[str, Any],
+    *,
+    strict: bool,
+) -> None:
+    if not strict:
+        return
+    keys = (
+        "teacher_type",
+        "teacher_model_name_or_path",
+        "teacher_vocab_size",
+        "student_type",
+        "student_vocab_size",
+        "student_hidden_size",
+        "student_num_layers",
+        "student_state_extraction",
+        "off_state_mode",
+        "delta_alt_mode",
+        "off_logits_mode",
+        "off_state_detach_direction",
+        "tokenizer_name_or_path",
+        "tokenizer_vocab_size",
+        "dataset_type",
+        "data_path",
+        "seq_len",
+        "gradient_accumulation_steps",
+        "mixed_precision",
+        "learning_rate",
+        "max_grad_norm",
+        "topk_enabled",
+        "top_k",
+        "topk_renormalize",
+        "teacher_cache_enabled",
+        "csdm_weight",
+        "kd_weight",
+        "ce_weight",
+        "tau",
+    )
+    mismatches: list[str] = []
+    for key in keys:
+        if checkpoint_metadata.get(key) != expected_metadata.get(key):
+            mismatches.append(
+                f"{key}: checkpoint={checkpoint_metadata.get(key)!r}, current={expected_metadata.get(key)!r}"
+            )
+    if mismatches:
+        raise ValueError("Checkpoint metadata is incompatible with the current run: " + "; ".join(mismatches))
+
+
+def _normalized_resume_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if config is None:
+        return None
+    normalized = dict(config)
+    normalized.pop("checkpoint", None)
+    teacher_cache = normalized.get("teacher_cache")
+    if isinstance(teacher_cache, dict):
+        teacher_cache = dict(teacher_cache)
+        teacher_cache.pop("cache_dir", None)
+        teacher_cache.pop("overwrite", None)
+        normalized["teacher_cache"] = teacher_cache
+    return normalized
+
+
+def _validate_resume_config_snapshot(
+    checkpoint_config: dict[str, Any] | None,
+    current_config: dict[str, Any],
+    *,
+    strict: bool,
+) -> None:
+    if not strict:
+        return
+    saved = _normalized_resume_config(checkpoint_config)
+    current = _normalized_resume_config(current_config)
+    if saved is None:
+        raise ValueError("Checkpoint config snapshot is missing; cannot strict-resume.")
+    if saved != current:
+        raise ValueError("Checkpoint config snapshot is incompatible with the current run.")
+
+
+def _load_resume_state_if_needed(
+    config: TrainConfig,
+    *,
+    student: StudentMamba,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    expected_metadata: dict[str, Any],
+    logger: ConsoleLogger,
+) -> int:
+    resume_path = _resolve_resume_checkpoint(config)
+    if resume_path is None:
+        return 0
+    checkpoint_payload = load_checkpoint(resume_path, map_location=device)
+    checkpoint_metadata = checkpoint_payload.get("metadata") or {}
+    if not isinstance(checkpoint_metadata, dict):
+        raise TypeError("training checkpoint metadata must be a dict.")
+    _validate_resume_config_snapshot(
+        checkpoint_payload.get("config"),
+        asdict(config),
+        strict=config.checkpoint.strict_resume,
+    )
+    _validate_resume_metadata(
+        checkpoint_metadata,
+        expected_metadata,
+        strict=config.checkpoint.strict_resume,
+    )
+    state = load_training_checkpoint(
+        resume_path,
+        student,
+        optimizer=optimizer,
+        map_location=device,
+        strict=config.checkpoint.strict_resume,
+        load_optimizer=config.checkpoint.load_optimizer,
+        load_rng_state=config.checkpoint.load_rng_state,
+    )
+    logger.log(
+        state.optimizer_step,
+        {
+            "event": "resume",
+            "resume_from": str(state.path),
+            "optimizer_step": state.optimizer_step,
+        },
+    )
+    return state.optimizer_step
+
+
+def _save_training_state(
+    config: TrainConfig,
+    *,
+    student: StudentMamba,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    metadata: dict[str, Any],
+) -> Path:
+    return save_training_checkpoint(
+        config.checkpoint.output_dir,
+        student,
+        optimizer,
+        step=step,
+        optimizer_step=step,
+        config=asdict(config),
+        metadata=metadata,
+        rng_state=True,
+    )
+
+
+def _advance_batches(batches: Iterator[dict[str, Tensor]], count: int) -> None:
+    for _ in range(count):
+        next(batches)
+
+
 def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | None = None) -> None:
     if max_steps <= 0:
         raise ValueError("max_steps must be positive.")
     if config.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
+    if config.checkpoint.save_every_steps < 0:
+        raise ValueError("checkpoint.save_every_steps must be non-negative.")
     if config.teacher_cache.enabled and config.teacher_cache.use_top_k:
         raise NotImplementedError(
             "Top-k-only teacher logit cache entries cannot be used by train.py yet. "
@@ -945,8 +1261,9 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     set_seed(config.seed)
     device = _training_device(config)
     tokenizer = _load_training_tokenizer(config)
+    tokenizer_vocab_size = None
     if tokenizer is not None:
-        tokenizer_vocab_size = _tokenizer_vocab_size(tokenizer)
+        tokenizer_vocab_size = get_tokenizer_vocab_size(tokenizer)
         if tokenizer_vocab_size <= 1:
             raise ValueError(f"tokenizer vocab size must be greater than 1, got {tokenizer_vocab_size}.")
         if config.data.dataset_type != "mock":
@@ -955,14 +1272,12 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     teacher_vocab_size = _teacher_vocab_size(teacher)
     if teacher_vocab_size <= 1:
         raise ValueError(f"teacher vocab_size must be greater than 1, got {teacher_vocab_size}.")
-    if tokenizer is not None:
-        tokenizer_vocab_size = _tokenizer_vocab_size(tokenizer)
-        if tokenizer_vocab_size != teacher_vocab_size:
-            raise ValueError(
-                "tokenizer and teacher vocab sizes must match for real text smoke training: "
-                f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}."
-            )
-    _validate_teacher_student_vocab(config, teacher_vocab_size)
+    vocab_report = _validate_vocab_for_training(
+        config,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        teacher_vocab_size=teacher_vocab_size,
+        tokenizer=tokenizer,
+    )
 
     dataset = _build_training_dataset(
         config,
@@ -978,8 +1293,26 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
     autocast_context = _autocast_context(config.mixed_precision, device)
     teacher_cache = TeacherLogitCache(config.teacher_cache) if config.teacher_cache.enabled else None
     teacher_cache_extra = _teacher_cache_extra(config, teacher_vocab_size)
+    checkpoint_metadata = _checkpoint_metadata(
+        config,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        teacher_vocab_size=teacher_vocab_size,
+        vocab_report=vocab_report,
+    )
+    start_optimizer_step = _load_resume_state_if_needed(
+        config,
+        student=student,
+        optimizer=optimizer,
+        device=device,
+        expected_metadata=checkpoint_metadata,
+        logger=logger,
+    )
+    if start_optimizer_step > 0:
+        _advance_batches(batches, start_optimizer_step * config.gradient_accumulation_steps)
+    if start_optimizer_step >= max_steps:
+        return
 
-    for step in range(1, max_steps + 1):
+    for step in range(start_optimizer_step + 1, max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         accum_metrics = {"total": 0.0, "ce": 0.0, "kd": 0.0, "csdm": 0.0}
 
@@ -987,6 +1320,12 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             batch = next(batches)
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
+            validate_token_id_ranges(
+                input_ids,
+                labels,
+                vocab_size=teacher_vocab_size,
+                ignored_label_id=config.vocab.ignored_label_id,
+            )
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
@@ -1033,6 +1372,17 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         metrics["accumulation_progress"] = f"{config.gradient_accumulation_steps}/{config.gradient_accumulation_steps}"
         if torch.cuda.is_available():
             metrics["cuda_memory_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        should_save = config.checkpoint.save_every_steps > 0 and step % config.checkpoint.save_every_steps == 0
+        should_save = should_save or (config.checkpoint.save_at_end and step == max_steps)
+        if should_save:
+            checkpoint_path = _save_training_state(
+                config,
+                student=student,
+                optimizer=optimizer,
+                step=step,
+                metadata=checkpoint_metadata,
+            )
+            metrics["checkpoint_path"] = str(checkpoint_path)
         logger.log(step, metrics)
 
 

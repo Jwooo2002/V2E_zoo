@@ -38,6 +38,10 @@ class MockTeacherWrapper(TeacherWrapper):
     def teacher_input_device(self) -> torch.device:
         return self.embedding.weight.device
 
+    @property
+    def vocab_size(self) -> int:
+        return int(self.embedding.num_embeddings)
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}.")
@@ -188,6 +192,16 @@ class HuggingFaceTeacherWrapper(TeacherWrapper):
             return next(self.model.parameters()).device
         except StopIteration:
             return torch.device("cpu")
+
+    @property
+    def vocab_size(self) -> int:
+        vocab_size = getattr(getattr(self.model, "config", None), "vocab_size", None)
+        if vocab_size is None:
+            tokenizer_vocab_size = getattr(self.tokenizer, "vocab_size", None)
+            if tokenizer_vocab_size is None:
+                raise ValueError("HuggingFace teacher must expose model.config.vocab_size for vocab alignment.")
+            return int(tokenizer_vocab_size)
+        return int(vocab_size)
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         if input_ids.ndim != 2:

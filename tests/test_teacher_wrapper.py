@@ -40,6 +40,7 @@ def _install_fake_transformers(
             super().__init__()
             self.weight = nn.Parameter(torch.ones(()))
             self.input_embeddings = nn.Embedding(5, 3)
+            self.config = types.SimpleNamespace(vocab_size=19)
             self.eval_called = False
             self.forward_grad_enabled: bool | None = None
             self.forward_attention_mask: torch.Tensor | None = None
@@ -203,6 +204,7 @@ def test_hf_wrapper_loads_fake_transformers_and_returns_detached_logits(
     assert fake_model.eval_called
     assert all(not parameter.requires_grad for parameter in fake_model.parameters())
     assert wrapper.teacher_input_device == fake_model.input_embeddings.weight.device
+    assert wrapper.vocab_size == 19
 
     input_ids = torch.randint(0, 13, (2, 4))
     attention_mask = torch.ones_like(input_ids)

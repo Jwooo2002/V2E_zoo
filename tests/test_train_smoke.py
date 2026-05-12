@@ -216,6 +216,148 @@ def test_train_mock_subprocess_topk_uses_full_cached_teacher_logits(tmp_path: Pa
     assert list(tmp_path.glob("*.pt"))
 
 
+def test_train_mock_checkpoint_save_resume_and_auto_resume(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "ckpt"
+    first = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "2",
+            "--gradient-accumulation-steps",
+            "1",
+            "--checkpoint-output-dir",
+            str(checkpoint_dir),
+            "--save-at-end",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    first_records = [json.loads(line) for line in first.stdout.splitlines() if line.startswith("{")]
+    checkpoint_path = checkpoint_dir / "checkpoint_step_2_opt_2.pt"
+
+    assert checkpoint_path.is_file()
+    assert first_records[-1]["checkpoint_path"] == str(checkpoint_path)
+
+    resumed = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "4",
+            "--gradient-accumulation-steps",
+            "1",
+            "--resume-from",
+            str(checkpoint_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    resumed_records = [json.loads(line) for line in resumed.stdout.splitlines() if line.startswith("{")]
+    train_records = [record for record in resumed_records if "total" in record]
+
+    assert resumed_records[0]["event"] == "resume"
+    assert resumed_records[0]["optimizer_step"] == 2
+    assert [record["optimizer_step"] for record in train_records] == [3, 4]
+
+    auto = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "3",
+            "--gradient-accumulation-steps",
+            "1",
+            "--checkpoint-output-dir",
+            str(checkpoint_dir),
+            "--auto-resume",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    auto_records = [json.loads(line) for line in auto.stdout.splitlines() if line.startswith("{")]
+    auto_train_records = [record for record in auto_records if "total" in record]
+
+    assert auto_records[0]["event"] == "resume"
+    assert auto_records[0]["optimizer_step"] == 2
+    assert [record["optimizer_step"] for record in auto_train_records] == [3]
+
+
+def test_train_mock_strict_resume_rejects_config_metadata_mismatch(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "ckpt"
+    subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "1",
+            "--seq-len",
+            "8",
+            "--batch-size",
+            "1",
+            "--gradient-accumulation-steps",
+            "1",
+            "--checkpoint-output-dir",
+            str(checkpoint_dir),
+            "--save-at-end",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    checkpoint_path = checkpoint_dir / "checkpoint_step_1_opt_1.pt"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "2",
+            "--seq-len",
+            "8",
+            "--batch-size",
+            "2",
+            "--gradient-accumulation-steps",
+            "1",
+            "--resume-from",
+            str(checkpoint_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+
+    assert result.returncode != 0
+    assert "Checkpoint config snapshot is incompatible" in result.stderr
+
+
 def _small_cache_config(tmp_path: Path, *, overwrite: bool = False, use_top_k: bool = False) -> train_module.TrainConfig:
     config = load_train_config(ROOT / "configs" / "train_config.yaml")
     return replace(
