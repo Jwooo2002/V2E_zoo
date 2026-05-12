@@ -22,6 +22,8 @@ KEY_TO_FLAG: dict[str, str | None] = {
     "teacher_type": "--teacher-type",
     "student_type": "--student-type",
     "teacher_model_name_or_path": "--teacher-model-name-or-path",
+    "hf_torch_dtype": "--hf-torch-dtype",
+    "hf_device_map": "--hf-device-map",
     "dataset_type": "--dataset-type",
     "data_path": "--data-path",
     "tokenizer_name_or_path": "--tokenizer-name-or-path",
@@ -54,6 +56,7 @@ KEY_TO_FLAG: dict[str, str | None] = {
     "teacher_cache_overwrite": "--teacher-cache-overwrite",
     "teacher_cache_use_top_k": "--teacher-cache-use-top-k",
     "teacher_cache_top_k": "--teacher-cache-top-k",
+    "teacher_cache_distributed_policy": "--teacher-cache-distributed-policy",
     "checkpoint_output_dir": "--checkpoint-output-dir",
     "save_every_steps": "--save-every-steps",
     "save_at_end": "--save-at-end",
@@ -62,6 +65,10 @@ KEY_TO_FLAG: dict[str, str | None] = {
     "strict_resume": "--strict-resume",
     "load_optimizer": "--load-optimizer",
     "load_rng_state": "--load-rng-state",
+    "distributed_mode": "--distributed-mode",
+    "distributed": "--distributed",
+    "distributed_backend": "--distributed-backend",
+    "ddp_find_unused_parameters": "--ddp-find-unused-parameters",
 }
 
 BOOLEAN_OPTIONAL_KEYS = {
@@ -78,6 +85,8 @@ BOOLEAN_OPTIONAL_KEYS = {
     "strict_resume",
     "load_optimizer",
     "load_rng_state",
+    "distributed",
+    "ddp_find_unused_parameters",
 }
 
 STORE_TRUE_KEYS = {"mock", "local_files_only"}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -214,6 +215,42 @@ def test_train_mock_subprocess_topk_uses_full_cached_teacher_logits(tmp_path: Pa
 
     assert [record["step"] for record in records] == [1, 2]
     assert list(tmp_path.glob("*.pt"))
+
+
+def test_train_mock_distributed_env_nonzero_rank_skips_logs_and_checkpoint(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "ckpt"
+    env = os.environ.copy()
+    env.update({"WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "0"})
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--config",
+            "configs/train_config.yaml",
+            "--mock",
+            "--max_steps",
+            "1",
+            "--gradient-accumulation-steps",
+            "1",
+            "--mixed-precision",
+            "no",
+            "--distributed-mode",
+            "env",
+            "--checkpoint-output-dir",
+            str(checkpoint_dir),
+            "--save-at-end",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+
+    assert result.stdout.strip() == ""
+    assert not list(checkpoint_dir.glob("*.pt"))
 
 
 def test_train_mock_checkpoint_save_resume_and_auto_resume(tmp_path: Path) -> None:

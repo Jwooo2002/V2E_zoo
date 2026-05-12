@@ -6,6 +6,11 @@ gradient_accumulation_steps: 16
 learning_rate: 1e-4
 max_grad_norm: 1.0
 
+distributed:
+  mode: none
+  backend:
+  find_unused_parameters: false
+
 data:
   dataset_type: mock
   path:
@@ -65,6 +70,7 @@ teacher_cache:
   use_top_k: false
   top_k: 256
   overwrite: false
+  distributed_policy: rank_local
 
 checkpoint:
   output_dir: checkpoints

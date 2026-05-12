@@ -26,6 +26,7 @@ class LogitCacheConfig:
     use_top_k: bool = False
     top_k: int = 256
     overwrite: bool = False
+    distributed_policy: str = "rank_local"
 
     def __post_init__(self) -> None:
         if self.format != "pt":
@@ -35,6 +36,11 @@ class LogitCacheConfig:
             raise ValueError(f"Unsupported cache dtype {self.dtype!r}; expected one of {supported}")
         if self.top_k <= 0:
             raise ValueError("LogitCacheConfig.top_k must be positive")
+        if self.distributed_policy not in {"rank_local", "shared_readonly", "rank_zero_write"}:
+            raise ValueError(
+                "LogitCacheConfig.distributed_policy must be one of: "
+                "rank_local, shared_readonly, rank_zero_write"
+            )
         try:
             torch.device(self.device)
         except (RuntimeError, ValueError) as exc:

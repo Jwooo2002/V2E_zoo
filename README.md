@@ -12,8 +12,8 @@ dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 6D/6E student-side state and approximate off-trajectory scaffolding, and
 Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
 local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
-alignment hardening, Stage 7C checkpoint/resume hardening, and Stage 7D
-small-experiment runner support:
+alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
+small-experiment runner support, and Stage 7E distributed 2x4090 preparation:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -43,6 +43,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   token-prefix teacher outputs, with full-logit and top-k storage modes.
 - `utils/checkpointing.py`: student/optimizer training checkpoint helpers with
   config, metadata, step counters, and RNG state for resume.
+- `utils/distributed.py`: small torch.distributed/DDP helpers for rank-zero
+  logging/checkpointing, rank-local cache paths, and metric averaging.
 - `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
   checks for `mamba_ssm` and `causal-conv1d`.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
@@ -53,6 +55,10 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   YAML configs to the existing `train.py` CLI, supports `--dry-run` and
   repeated `--override key=value`, prints the subprocess command, and rejects
   unknown keys.
+- `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
+  smoke template.
+- `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
+  mock distributed smoke template.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits, plus
   an optional `RealMambaStudent` adapter with lazy `mamba_ssm` import, public
@@ -67,7 +73,7 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `train.py`: mock training plus opt-in HuggingFace-teacher smoke paths for a
   mock student or `RealMambaStudent`, with gradient accumulation, CUDA-only
   autocast, optional full-logit teacher caching, shared valid-position masking,
-  and JSON console metrics.
+  JSON console metrics, and rank-aware launch scaffolding.
 - `evaluate.py`: mock-only Stage 4 evaluation CLI with JSON metrics.
 - `evals/perplexity.py`: token-weighted next-token CE/perplexity evaluation.
 - `evals/perturbation_robustness.py`: token-weighted
@@ -83,6 +89,12 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `configs/experiments/smoke_mock.yaml`: mock-only small experiment config.
 - `configs/experiments/smoke_real_mamba.yaml`: opt-in local-files-only
   HF-teacher/real-Mamba smoke command template.
+- `configs/accelerate_2x4090.yaml`: local 2-process Accelerate template for
+  GPUs `0,1`.
+- `configs/experiments/smoke_2x4090_mock.yaml`: mock distributed smoke
+  template.
+- `configs/experiments/smoke_2x4090_real_mamba.yaml`: local-files-only
+  HF-teacher/real-Mamba distributed smoke template.
 - `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
@@ -481,8 +493,8 @@ python scripts/run_small_experiment.py \
   --experiment configs/experiments/smoke_real_mamba.yaml
 ```
 
-This is still small-scale, single-process tooling. Distributed or 2x4090
-training orchestration is intentionally left for a later stage.
+This remains small-scale tooling. Stage 7E adds distributed launch scaffolding
+for smoke preparation, but it is not yet a large-scale training recipe.
 
 Mock teacher/student text smoke:
 
@@ -523,6 +535,57 @@ python train.py \
   --csdm-weight 0.03 \
   --topk-enabled \
   --top-k 128
+```
+
+## Stage 7E Distributed 2x4090 Preparation
+
+Stage 7E adds launch and rank-awareness scaffolding around the existing
+`train.py` loop. It does not change CE/KD/CSDM math, teacher inputs, top-k
+behavior, or real Mamba/Llama import policy.
+
+Distributed behavior:
+
+- `--distributed-mode env` reads `RANK`, `LOCAL_RANK`, and `WORLD_SIZE` from
+  a torchrun/Accelerate-style environment;
+- `--distributed-mode ddp` is reserved and currently raises a clear
+  `NotImplementedError`;
+- Stage 7E does not wrap the student with `DistributedDataParallel` yet;
+- training data may be rank-partitioned for smoke runs, but this is still
+  preparation scaffolding rather than production distributed training;
+- JSON metric logging and checkpoint writes happen only on global rank zero;
+- teacher cache paths become rank-local, for example
+  `/tmp/cache/rank_00000` and `/tmp/cache/rank_00001`;
+- effective batch size is logged as
+  `batch_size * gradient_accumulation_steps * world_size`.
+
+Teacher cache policy defaults to `rank_local`, avoiding writable cache races
+between ranks. Shared read-only or rank-zero-write cache modes are reserved for
+later tightening.
+
+Mock distributed smoke:
+
+```bash
+scripts/launch_mock_distributed_smoke.sh
+```
+
+Real-Mamba distributed smoke template:
+
+```bash
+scripts/launch_2x4090.sh
+```
+
+The real-Mamba template is opt-in and uses `local_files_only: true`; it
+requires local/cached HF artifacts plus `mamba_ssm`. It sets
+`hf_device_map: none` so each rank loads a rank-local teacher on its assigned
+device instead of asking Transformers to shard the frozen teacher across both
+4090s.
+
+You can inspect either command without launching Accelerate:
+
+```bash
+python scripts/run_small_experiment.py \
+  --experiment configs/experiments/smoke_2x4090_mock.yaml \
+  --dry-run
 ```
 
 ## Stage 6B Mamba Dependency Diagnostics

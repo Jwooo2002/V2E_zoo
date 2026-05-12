@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 import math
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ import torch.nn.functional as F
 import yaml
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from data.dataset import MockTextDataset, TextDatasetConfig, TokenizedTextDataset
 from data.tokenizer import TokenizerConfig, load_tokenizer
@@ -32,6 +34,16 @@ from models.student_mamba import (
 )
 from models.teacher_wrapper import HuggingFaceTeacherConfig, HuggingFaceTeacherWrapper, MockTeacherWrapper
 from utils.checkpointing import latest_checkpoint, load_checkpoint, load_training_checkpoint, save_training_checkpoint
+from utils.distributed import (
+    DistributedContext,
+    RankZeroLogger,
+    average_float_dict,
+    barrier,
+    cleanup_distributed,
+    effective_batch_size,
+    init_distributed,
+    rank_local_dir,
+)
 from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
 
@@ -118,6 +130,13 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True)
+class DistributedConfig:
+    mode: str = "none"
+    backend: str | None = None
+    find_unused_parameters: bool = False
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     seed: int = 42
     teacher_type: str = "mock"
@@ -127,6 +146,7 @@ class TrainConfig:
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
     topk: TopKConfig = field(default_factory=TopKConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
     teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -146,6 +166,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-type", choices=("mock", "hf"), default=None)
     parser.add_argument("--student-type", choices=("mock", "mamba"), default=None)
     parser.add_argument("--teacher-model-name-or-path", default=None)
+    parser.add_argument("--hf-torch-dtype", choices=("float32", "float16", "bfloat16"), default=None)
+    parser.add_argument("--hf-device-map", default=None, help="HF teacher device_map; use 'none' for rank-local .to(device).")
     parser.add_argument("--dataset-type", choices=("mock", "text", "jsonl"), default=None)
     parser.add_argument("--data-path", default=None)
     parser.add_argument("--tokenizer-name-or-path", default=None)
@@ -218,6 +240,11 @@ def parse_args() -> argparse.Namespace:
         help="Store top-k-only teacher cache entries. Training raises until this loss path is implemented.",
     )
     parser.add_argument("--teacher-cache-top-k", type=int, default=None)
+    parser.add_argument(
+        "--teacher-cache-distributed-policy",
+        choices=("rank_local", "shared_readonly", "rank_zero_write"),
+        default=None,
+    )
     parser.add_argument("--checkpoint-output-dir", type=str, default=None)
     parser.add_argument("--save-every-steps", type=int, default=None)
     parser.add_argument("--save-at-end", action=argparse.BooleanOptionalAction, default=None)
@@ -226,6 +253,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-resume", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--load-optimizer", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--load-rng-state", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--distributed-mode",
+        choices=("none", "env", "ddp"),
+        default=None,
+        help="Stage 7E distributed scaffold mode. 'env' is rank-aware without DDP; 'ddp' is reserved.",
+    )
+    parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--distributed-backend", choices=("nccl", "gloo"), default=None)
+    parser.add_argument("--ddp-find-unused-parameters", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
 
@@ -251,6 +287,12 @@ def _optional_str(value: Any) -> str | None:
     return None if value in (None, "") else str(value)
 
 
+def _optional_device_map(value: Any) -> str | None:
+    if value in (None, "", "none", "None", "null", "Null"):
+        return None
+    return str(value)
+
+
 def _parse_logit_cache_config(raw: dict[str, Any]) -> LogitCacheConfig:
     return LogitCacheConfig(
         enabled=bool(_nested_get(raw, "enabled", LogitCacheConfig.enabled)),
@@ -261,6 +303,7 @@ def _parse_logit_cache_config(raw: dict[str, Any]) -> LogitCacheConfig:
         use_top_k=bool(_nested_get(raw, "use_top_k", LogitCacheConfig.use_top_k)),
         top_k=int(_nested_get(raw, "top_k", LogitCacheConfig.top_k)),
         overwrite=bool(_nested_get(raw, "overwrite", LogitCacheConfig.overwrite)),
+        distributed_policy=str(_nested_get(raw, "distributed_policy", LogitCacheConfig.distributed_policy)),
     )
 
 
@@ -309,6 +352,20 @@ def _parse_checkpoint_config(raw: dict[str, Any]) -> CheckpointConfig:
         strict_resume=bool(_nested_get(raw, "strict_resume", CheckpointConfig.strict_resume)),
         load_optimizer=bool(_nested_get(raw, "load_optimizer", CheckpointConfig.load_optimizer)),
         load_rng_state=bool(_nested_get(raw, "load_rng_state", CheckpointConfig.load_rng_state)),
+    )
+
+
+def _parse_distributed_config(raw: dict[str, Any]) -> DistributedConfig:
+    legacy_enabled = raw.get("enabled")
+    mode = str(_nested_get(raw, "mode", "env" if legacy_enabled else "none"))
+    if mode not in {"none", "env", "ddp"}:
+        raise ValueError("distributed.mode must be one of: none, env, ddp.")
+    return DistributedConfig(
+        mode=mode,
+        backend=_optional_str(raw.get("backend")),
+        find_unused_parameters=bool(
+            _nested_get(raw, "find_unused_parameters", DistributedConfig.find_unused_parameters)
+        ),
     )
 
 
@@ -362,6 +419,7 @@ def load_train_config(path: Path) -> TrainConfig:
     hf_raw = raw.get("hf_teacher", raw.get("hf_teacher_example", {}))
     teacher_cache_raw = raw.get("teacher_cache", {}) or {}
     checkpoint_raw = raw.get("checkpoint", {}) or {}
+    distributed_raw = raw.get("distributed", {}) or {}
     loss = LossConfig(
         ce_weight=float(_nested_get(loss_raw, "ce_weight", LossConfig.ce_weight)),
         kd_weight=float(_nested_get(loss_raw, "kd_weight", LossConfig.kd_weight)),
@@ -394,6 +452,7 @@ def load_train_config(path: Path) -> TrainConfig:
         renormalize_topk=bool(_nested_get(topk_raw, "renormalize_topk", TopKConfig.renormalize_topk)),
     )
     checkpoint = _parse_checkpoint_config(checkpoint_raw)
+    distributed = _parse_distributed_config(distributed_raw)
     hf_teacher = HuggingFaceRuntimeConfig(
         model_name_or_path=_optional_str(hf_raw.get("model_name_or_path")),
         torch_dtype=str(hf_raw.get("torch_dtype", HuggingFaceRuntimeConfig.torch_dtype)),
@@ -421,6 +480,7 @@ def load_train_config(path: Path) -> TrainConfig:
         learning_rate=float(_nested_get(raw, "learning_rate", TrainConfig.learning_rate)),
         max_grad_norm=float(_nested_get(raw, "max_grad_norm", TrainConfig.max_grad_norm)),
         topk=topk,
+        distributed=distributed,
         teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
         checkpoint=checkpoint,
         loss=loss,
@@ -543,6 +603,10 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             config,
             hf_teacher=replace(config.hf_teacher, model_name_or_path=args.teacher_model_name_or_path),
         )
+    if getattr(args, "hf_torch_dtype", None) is not None:
+        config = replace(config, hf_teacher=replace(config.hf_teacher, torch_dtype=args.hf_torch_dtype))
+    if getattr(args, "hf_device_map", None) is not None:
+        config = replace(config, hf_teacher=replace(config.hf_teacher, device_map=_optional_device_map(args.hf_device_map)))
     if not args.mock and getattr(args, "dataset_type", None) is not None:
         config = replace(config, data=replace(config.data, dataset_type=_normalize_dataset_type(args.dataset_type)))
     if not args.mock and getattr(args, "data_path", None) is not None:
@@ -632,6 +696,14 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, teacher_cache=replace(config.teacher_cache, use_top_k=args.teacher_cache_use_top_k))
     if getattr(args, "teacher_cache_top_k", None) is not None:
         config = replace(config, teacher_cache=replace(config.teacher_cache, top_k=args.teacher_cache_top_k))
+    if getattr(args, "teacher_cache_distributed_policy", None) is not None:
+        config = replace(
+            config,
+            teacher_cache=replace(
+                config.teacher_cache,
+                distributed_policy=args.teacher_cache_distributed_policy,
+            ),
+        )
     if getattr(args, "checkpoint_output_dir", None) is not None:
         config = replace(config, checkpoint=replace(config.checkpoint, output_dir=args.checkpoint_output_dir))
     if getattr(args, "save_every_steps", None) is not None:
@@ -648,6 +720,20 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, checkpoint=replace(config.checkpoint, load_optimizer=args.load_optimizer))
     if getattr(args, "load_rng_state", None) is not None:
         config = replace(config, checkpoint=replace(config.checkpoint, load_rng_state=args.load_rng_state))
+    if getattr(args, "distributed_mode", None) is not None:
+        config = replace(config, distributed=replace(config.distributed, mode=args.distributed_mode))
+    if getattr(args, "distributed", None) is not None:
+        config = replace(config, distributed=replace(config.distributed, mode="env" if args.distributed else "none"))
+    if getattr(args, "distributed_backend", None) is not None:
+        config = replace(config, distributed=replace(config.distributed, backend=args.distributed_backend))
+    if getattr(args, "ddp_find_unused_parameters", None) is not None:
+        config = replace(
+            config,
+            distributed=replace(
+                config.distributed,
+                find_unused_parameters=args.ddp_find_unused_parameters,
+            ),
+        )
     if config.student_type == "mamba" and config.teacher_type == "mock":
         config = replace(config, mock=replace(config.mock, vocab_size=config.mamba_student.vocab_size))
     if config.teacher_type == "hf" and config.data.dataset_type != "mock" and config.data.tokenizer_name_or_path is None:
@@ -662,8 +748,15 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def infinite_loader(loader: DataLoader[dict[str, Tensor]]) -> Iterator[dict[str, Tensor]]:
+def infinite_loader(
+    loader: DataLoader[dict[str, Tensor]],
+    sampler: Any | None = None,
+) -> Iterator[dict[str, Tensor]]:
+    epoch = 0
     while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+            epoch += 1
         for batch in loader:
             yield batch
 
@@ -810,7 +903,9 @@ def _autocast_context(mixed_precision: str, device: torch.device) -> Any:
     raise ValueError("mixed_precision must be one of: no, fp16, bf16.")
 
 
-def _training_device(config: TrainConfig) -> torch.device:
+def _training_device(config: TrainConfig, distributed: DistributedContext | None = None) -> torch.device:
+    if distributed is not None and distributed.enabled:
+        return distributed.device
     if config.teacher_type == "hf" and config.hf_teacher.device_map == "cpu":
         return torch.device("cpu")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1030,10 +1125,11 @@ def _checkpoint_metadata(
     tokenizer_vocab_size: int | None,
     teacher_vocab_size: int,
     vocab_report: Any,
+    distributed: DistributedContext | None = None,
 ) -> dict[str, Any]:
     student_vocab_size = _effective_student_vocab_size(config, teacher_vocab_size)
     return {
-        "project_stage": "7C",
+        "project_stage": "7E",
         "teacher_type": config.teacher_type,
         "teacher_model_name_or_path": config.hf_teacher.model_name_or_path,
         "teacher_vocab_size": teacher_vocab_size,
@@ -1065,6 +1161,15 @@ def _checkpoint_metadata(
         "kd_weight": config.loss.kd_weight,
         "ce_weight": config.loss.ce_weight,
         "tau": config.loss.tau,
+        "distributed_enabled": bool(distributed.enabled) if distributed is not None else False,
+        "distributed_world_size": distributed.world_size if distributed is not None else 1,
+        "distributed_rank": distributed.rank if distributed is not None else 0,
+        "distributed_local_rank": distributed.local_rank if distributed is not None else 0,
+        "effective_batch_size": effective_batch_size(
+            config.mock.batch_size,
+            config.gradient_accumulation_steps,
+            distributed.world_size if distributed is not None else 1,
+        ),
         "vocab_alignment": asdict(vocab_report) if hasattr(vocab_report, "__dataclass_fields__") else vocab_report,
     }
 
@@ -1282,8 +1387,51 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             "or set --csdm-weight 0.0."
         )
 
-    set_seed(config.seed)
-    device = _training_device(config)
+    distributed = init_distributed(mode=config.distributed.mode, backend=config.distributed.backend)
+    try:
+        set_seed(config.seed)
+        device = _training_device(config, distributed)
+        config = _apply_distributed_teacher_cache_policy(config, distributed)
+        _run_training_inner(config, max_steps=max_steps, logger=logger, distributed=distributed, device=device)
+    finally:
+        cleanup_distributed(distributed)
+
+
+def _apply_distributed_teacher_cache_policy(config: TrainConfig, distributed: DistributedContext) -> TrainConfig:
+    if not distributed.enabled or not config.teacher_cache.enabled:
+        return config
+    policy = config.teacher_cache.distributed_policy
+    if policy == "rank_local":
+        return replace(
+            config,
+            teacher_cache=replace(
+                config.teacher_cache,
+                cache_dir=rank_local_dir(config.teacher_cache.cache_dir, distributed),
+            ),
+        )
+    if policy == "rank_zero_write":
+        return config if distributed.is_rank_zero else replace(
+            config,
+            teacher_cache=replace(config.teacher_cache, enabled=False),
+        )
+    if policy == "shared_readonly":
+        raise NotImplementedError(
+            "teacher_cache.distributed_policy=shared_readonly is reserved for prefilled caches. "
+            "Use rank_local for Stage 7E smoke runs."
+        )
+    raise ValueError(
+        "teacher_cache.distributed_policy must be one of: rank_local, shared_readonly, rank_zero_write."
+    )
+
+
+def _run_training_inner(
+    config: TrainConfig,
+    *,
+    max_steps: int,
+    logger: ConsoleLogger | None,
+    distributed: DistributedContext,
+    device: torch.device,
+) -> None:
     tokenizer = _load_training_tokenizer(config)
     tokenizer_vocab_size = None
     if tokenizer is not None:
@@ -1308,12 +1456,24 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         tokenizer=tokenizer,
         vocab_size=teacher_vocab_size,
     )
-    loader = DataLoader(dataset, batch_size=config.mock.batch_size, shuffle=False, drop_last=False)
-    batches = infinite_loader(loader)
+    sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        if distributed.enabled
+        else None
+    )
+    loader = DataLoader(dataset, batch_size=config.mock.batch_size, shuffle=False, sampler=sampler, drop_last=False)
+    batches = infinite_loader(loader, sampler=sampler)
 
     student = _build_student(config, teacher_vocab_size, device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
-    logger = logger if logger is not None else ConsoleLogger()
+    base_logger = logger if logger is not None else ConsoleLogger()
+    logger = RankZeroLogger(base_logger, distributed)
     autocast_context = _autocast_context(config.mixed_precision, device)
     teacher_cache = TeacherLogitCache(config.teacher_cache) if config.teacher_cache.enabled else None
     teacher_cache_extra = _teacher_cache_extra(config, teacher_vocab_size)
@@ -1322,6 +1482,7 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         tokenizer_vocab_size=tokenizer_vocab_size,
         teacher_vocab_size=teacher_vocab_size,
         vocab_report=vocab_report,
+        distributed=distributed,
     )
     start_optimizer_step = _load_resume_state_if_needed(
         config,
@@ -1335,7 +1496,6 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         _advance_batches(batches, start_optimizer_step * config.gradient_accumulation_steps)
     if start_optimizer_step >= max_steps:
         return
-
     for step in range(start_optimizer_step + 1, max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         accum_metrics = {"total": 0.0, "ce": 0.0, "kd": 0.0, "csdm": 0.0}
@@ -1390,15 +1550,24 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         divisor = float(config.gradient_accumulation_steps)
         metrics = {name: value / divisor for name, value in accum_metrics.items()}
         metrics["grad_norm"] = grad_before_clip
+        metrics = average_float_dict(metrics, distributed)
         metrics["optimizer_step"] = step
         metrics["micro_step"] = config.gradient_accumulation_steps
         metrics["accumulation_steps"] = config.gradient_accumulation_steps
         metrics["accumulation_progress"] = f"{config.gradient_accumulation_steps}/{config.gradient_accumulation_steps}"
+        metrics["rank"] = distributed.rank
+        metrics["local_rank"] = distributed.local_rank
+        metrics["world_size"] = distributed.world_size
+        metrics["effective_batch_size"] = effective_batch_size(
+            config.mock.batch_size,
+            config.gradient_accumulation_steps,
+            distributed.world_size,
+        )
         if torch.cuda.is_available():
             metrics["cuda_memory_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
         should_save = config.checkpoint.save_every_steps > 0 and step % config.checkpoint.save_every_steps == 0
         should_save = should_save or (config.checkpoint.save_at_end and step == max_steps)
-        if should_save:
+        if should_save and distributed.is_rank_zero:
             checkpoint_path = _save_training_state(
                 config,
                 student=student,
@@ -1407,6 +1576,8 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
                 metadata=checkpoint_metadata,
             )
             metrics["checkpoint_path"] = str(checkpoint_path)
+        if should_save:
+            barrier(distributed)
         logger.log(step, metrics)
 
 
@@ -1419,7 +1590,7 @@ def main() -> None:
     try:
         config = derive_runtime_config(args)
         run_training(config, max_steps=args.max_steps)
-    except (ImportError, NotImplementedError, ValueError) as exc:
+    except (ImportError, NotImplementedError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
 
