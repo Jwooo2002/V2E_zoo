@@ -14,8 +14,9 @@ Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
 local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
 alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
 small-experiment runner support, Stage 7E distributed 2x4090 preparation,
-Stage 8A ablation matrix orchestration, Stage 8B result reporting, and
-Stage 8C perturbation robustness benchmarking:
+Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
+perturbation robustness benchmarking, and Stage 8D synthetic
+Needle-in-a-Haystack benchmarking:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -68,6 +69,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `scripts/run_perturbation_benchmark.py`: Stage 8C benchmark CLI for
   `KL_on`, `KL_off`, `Delta_KL`, optional top-k approximation, position-wise
   reporting, and perturbation-mode sweeps.
+- `scripts/run_needle_benchmark.py`: Stage 8D synthetic Needle-in-a-Haystack
+  benchmark CLI with deterministic context/position sweeps, oracle/wrong mock
+  predictors, and JSON/CSV exports.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -92,8 +96,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `evals/perturbation_robustness.py`: token-weighted
   `KL(teacher || student)` comparison for clean and off-trajectory student
   logits.
-- `evals/needle.py`: deterministic synthetic Needle-in-a-Haystack metric
-  scaffold for mock mode only.
+- `evals/needle.py`: deterministic synthetic Needle-in-a-Haystack generation,
+  exact/contains scoring, and the legacy mock `evaluate.py` compatibility
+  wrapper.
 - `configs/train_config.yaml`: minimal training/loss defaults for mock mode.
 - `configs/ds_config.json`: placeholder future DeepSpeed config; DeepSpeed is
   not a required dependency.
@@ -731,6 +736,44 @@ Top-k indices are built from detached clean teacher logits only, then applied to
 teacher/on/off logits consistently. The teacher still consumes only clean
 `input_ids` and optional `attention_mask`; it never consumes `h_t`, `h'_t`,
 `h_delta_alt`, or perturbed token inputs.
+
+## Stage 8D Needle-in-a-Haystack Benchmark
+
+Stage 8D is evaluation-only. It generates synthetic key-value needles inside
+plain-text haystacks at configurable context lengths and position fractions,
+then scores predictions with exact-match and contains-match accuracy. It does
+not train, does not change CE/KD/CSDM loss math, and does not change teacher or
+Mamba internals.
+
+The mock predictors are for pipeline validation:
+
+- `oracle`: returns the known answer and should score 1.0;
+- `wrong`: returns deterministic incorrect answers and should score 0.0.
+
+Real model generation is intentionally a scaffold in this stage and raises a
+clear `NotImplementedError` rather than pretending to evaluate long-context
+reasoning.
+
+Example:
+
+```bash
+python scripts/run_needle_benchmark.py \
+  --mock \
+  --predictor oracle \
+  --num-examples 4 \
+  --context-lengths 128,256 \
+  --needle-positions 0.1,0.5,0.9 \
+  --output-json /tmp/csdm_needle.json \
+  --output-csv /tmp/csdm_needle.csv \
+  --print-summary
+```
+
+The JSON summary includes `accuracy_exact`, `accuracy_contains`,
+`num_examples`, `by_context_length`, `by_position`, and `metadata`. The CSV has
+one row per generated example with `example_id`, `context_length`, `position`,
+`answer`, `prediction`, `exact`, and `contains`. The existing
+`evaluate.py --mock --mode needle` command remains a compact legacy scaffold
+that returns the original five fields used by smoke tests.
 
 ## Stage 6B Mamba Dependency Diagnostics
 
