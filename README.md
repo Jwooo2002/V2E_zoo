@@ -10,7 +10,8 @@ with a mock student, Stage 5E teacher-cache integration in training,
 Stage 6A optional real-Mamba student adapter scaffold, Stage 6B Mamba
 dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 6D/6E student-side state and approximate off-trajectory scaffolding, and
-Stage 6F opt-in HF-teacher/RealMambaStudent smoke training:
+Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, and Stage 7A
+local tokenizer/text data smoke support:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -49,7 +50,10 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   an optional `RealMambaStudent` adapter with lazy `mamba_ssm` import, public
   `MambaLMHeadModel` support, and no private-internal assumptions.
 - `data/dataset.py`: deterministic random-token mock dataset with next-token
-  shifted labels and `ignore_index` on the final placeholder token.
+  shifted labels, plus local text/JSONL tokenized datasets with right padding,
+  attention masks, and invalid labels set to `ignore_index`.
+- `data/tokenizer.py`: lazy HuggingFace tokenizer loader for opt-in local text
+  data, with configurable pad-token handling.
 - `train.py`: mock training plus opt-in HuggingFace-teacher smoke paths for a
   mock student or `RealMambaStudent`, with gradient accumulation, CUDA-only
   autocast, optional full-logit teacher caching, shared valid-position masking,
@@ -304,6 +308,71 @@ For HF teacher smoke training, the real-Mamba student vocab size is aligned to
 the teacher vocab size unless `--student-vocab-size` is explicitly provided.
 If an explicit student vocab override does not match the teacher, training
 raises during teacher/student logit validation.
+
+## Stage 7A Tokenizer And Local Text Data
+
+Stage 7A adds an opt-in local text data path for tiny smoke tests. It does not
+change CE/KD/CSDM math and does not add large-scale dataset streaming. Mock data
+remains the default.
+
+Supported formats:
+
+- `dataset_type=text`: read a local plain-text file.
+- `dataset_type=jsonl`: read local JSONL rows from `text_field` (default
+  `text`).
+
+The tokenizer is loaded lazily through `data/tokenizer.py`. Tests use fake
+tokenizers and do not download models. For HF teacher runs, omit
+`--tokenizer-name-or-path` to default to `--teacher-model-name-or-path`.
+
+Label and mask convention:
+
+- `input_ids` are fixed length `[T]`, right-padded if needed.
+- `attention_mask` is `1` for real tokens and `0` for padding.
+- `labels[t] = input_ids[t + 1]` when both positions are real tokens.
+- the final position and all padding-derived positions use `-100`.
+- CE, KD, and CSDM continue to use one shared valid-token mask from labels.
+
+Mock teacher/student text smoke:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --dataset-type text \
+  --data-path data/smoke.txt \
+  --tokenizer-name-or-path sshleifer/tiny-gpt2 \
+  --teacher-type mock \
+  --student-type mock \
+  --max_steps 1 \
+  --seq-len 16 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --mixed-precision no
+```
+
+Manual HF teacher + real-Mamba text smoke. This can download or require local
+HF files, so it is not used by tests:
+
+```bash
+python train.py \
+  --config configs/train_config.yaml \
+  --teacher-type hf \
+  --student-type mamba \
+  --teacher-model-name-or-path sshleifer/tiny-gpt2 \
+  --tokenizer-name-or-path sshleifer/tiny-gpt2 \
+  --dataset-type text \
+  --data-path data/smoke.txt \
+  --max_steps 1 \
+  --seq-len 16 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --student-hidden-size 64 \
+  --student-num-layers 2 \
+  --mixed-precision no \
+  --csdm-weight 0.03 \
+  --topk-enabled \
+  --top-k 128
+```
 
 ## Stage 6B Mamba Dependency Diagnostics
 

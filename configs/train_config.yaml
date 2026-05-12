@@ -6,6 +6,22 @@ gradient_accumulation_steps: 16
 learning_rate: 1e-4
 max_grad_norm: 1.0
 
+data:
+  dataset_type: mock
+  path:
+  tokenizer_name_or_path:
+  seq_len: 128
+  stride:
+  max_examples:
+  text_field: text
+  add_eos: true
+  shuffle: false
+  seed: 42
+  use_fast: true
+  trust_remote_code: false
+  local_files_only: false
+  pad_token_strategy: eos
+
 student:
   type: mock
   model_name_or_path:

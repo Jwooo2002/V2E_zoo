@@ -60,5 +60,13 @@ hf_teacher_smoke_training:
   student_type: mock_or_mamba
   notes:
     - The real HuggingFace teacher smoke path can use MockStudentMamba or explicit RealMambaStudent.
-    - Teacher inputs are clean input_ids plus all-ones attention_mask from the train loop.
+    - Teacher inputs are clean input_ids plus attention_mask from the batch when present.
     - Tests use a fake transformers module and do not download model weights.
+
+tokenizer_data:
+  stage: 7A
+  enabled_by_cli: true
+  notes:
+    - Real text/jsonl data is opt-in; mock data remains default.
+    - HF teacher smoke should use the same tokenizer as the teacher model.
+    - Tests use fake/local tokenizers and do not download model files.

@@ -17,7 +17,8 @@ import yaml
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from data.dataset import MockTextDataset
+from data.dataset import MockTextDataset, TextDatasetConfig, TokenizedTextDataset
+from data.tokenizer import TokenizerConfig, load_tokenizer
 from losses.cdm_loss import csdm_loss
 from losses.kd_loss import build_topk_indices, kd_kl_loss
 from models.cdm_engine import OffTrajectoryConfig
@@ -57,6 +58,24 @@ class MockConfig:
 
 
 @dataclass(frozen=True)
+class DataConfig:
+    dataset_type: str = "mock"
+    path: str | None = None
+    tokenizer_name_or_path: str | None = None
+    seq_len: int = 128
+    stride: int | None = None
+    max_examples: int | None = None
+    text_field: str = "text"
+    add_eos: bool = True
+    shuffle: bool = False
+    seed: int = 42
+    use_fast: bool = True
+    trust_remote_code: bool = False
+    local_files_only: bool = False
+    pad_token_strategy: str = "eos"
+
+
+@dataclass(frozen=True)
 class HuggingFaceRuntimeConfig:
     model_name_or_path: str | None = None
     torch_dtype: str = "bfloat16"
@@ -89,6 +108,7 @@ class TrainConfig:
     topk: TopKConfig = field(default_factory=TopKConfig)
     teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
     loss: LossConfig = field(default_factory=LossConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     mock: MockConfig = field(default_factory=MockConfig)
     mamba_student: MambaStudentConfig = field(default_factory=MambaStudentConfig)
     student_vocab_size_explicit: bool = False
@@ -103,6 +123,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-type", choices=("mock", "hf"), default=None)
     parser.add_argument("--student-type", choices=("mock", "mamba"), default=None)
     parser.add_argument("--teacher-model-name-or-path", default=None)
+    parser.add_argument("--dataset-type", choices=("mock", "text", "jsonl"), default=None)
+    parser.add_argument("--data-path", default=None)
+    parser.add_argument("--tokenizer-name-or-path", default=None)
+    parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--text-field", default=None)
     parser.add_argument("--student-model-name-or-path", default=None)
     parser.add_argument("--student-vocab-size", type=int, default=None)
     parser.add_argument("--student-hidden-size", type=int, default=None)
@@ -202,6 +227,31 @@ def _parse_logit_cache_config(raw: dict[str, Any]) -> LogitCacheConfig:
     )
 
 
+def _normalize_dataset_type(value: str) -> str:
+    if value in {"mock", "text", "jsonl"}:
+        return value
+    raise ValueError(f"Unsupported dataset_type {value!r}; expected 'mock', 'text', or 'jsonl'.")
+
+
+def _parse_data_config(raw: dict[str, Any]) -> DataConfig:
+    return DataConfig(
+        dataset_type=_normalize_dataset_type(str(_nested_get(raw, "dataset_type", DataConfig.dataset_type))),
+        path=_optional_str(raw.get("path")),
+        tokenizer_name_or_path=_optional_str(raw.get("tokenizer_name_or_path")),
+        seq_len=int(_nested_get(raw, "seq_len", DataConfig.seq_len)),
+        stride=None if raw.get("stride") in (None, "") else int(raw["stride"]),
+        max_examples=None if raw.get("max_examples") in (None, "") else int(raw["max_examples"]),
+        text_field=str(_nested_get(raw, "text_field", DataConfig.text_field)),
+        add_eos=bool(_nested_get(raw, "add_eos", DataConfig.add_eos)),
+        shuffle=bool(_nested_get(raw, "shuffle", DataConfig.shuffle)),
+        seed=int(_nested_get(raw, "seed", DataConfig.seed)),
+        use_fast=bool(_nested_get(raw, "use_fast", DataConfig.use_fast)),
+        trust_remote_code=bool(_nested_get(raw, "trust_remote_code", DataConfig.trust_remote_code)),
+        local_files_only=bool(_nested_get(raw, "local_files_only", DataConfig.local_files_only)),
+        pad_token_strategy=str(_nested_get(raw, "pad_token_strategy", DataConfig.pad_token_strategy)),
+    )
+
+
 def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
     return MambaStudentConfig(
         model_name_or_path=_optional_str(raw.get("model_name_or_path")),
@@ -242,6 +292,7 @@ def load_train_config(path: Path) -> TrainConfig:
 
     loss_raw = raw.get("loss", {})
     mock_raw = raw.get("mock", {})
+    data_raw = raw.get("data", {})
     teacher_raw = raw.get("teacher", {})
     student_raw = raw.get("student", {})
     hf_raw = raw.get("hf_teacher", raw.get("hf_teacher_example", {}))
@@ -291,6 +342,7 @@ def load_train_config(path: Path) -> TrainConfig:
         load_in_4bit=bool(hf_raw.get("load_in_4bit", HuggingFaceRuntimeConfig.load_in_4bit)),
     )
     mamba_student = _parse_mamba_student_config(student_raw)
+    data = _parse_data_config(data_raw)
     return TrainConfig(
         seed=int(_nested_get(raw, "seed", TrainConfig.seed)),
         teacher_type=_normalize_teacher_type(str(teacher_raw.get("type", raw.get("teacher_type", "mock")))),
@@ -304,6 +356,7 @@ def load_train_config(path: Path) -> TrainConfig:
         topk=topk,
         teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
         loss=loss,
+        data=data,
         mock=mock,
         mamba_student=mamba_student,
         hf_teacher=hf_teacher,
@@ -350,7 +403,7 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
     config = load_train_config(args.config)
 
     if args.mock:
-        config = replace(config, teacher_type="mock", student_type="mock")
+        config = replace(config, teacher_type="mock", student_type="mock", data=replace(config.data, dataset_type="mock"))
     else:
         teacher_type = args.teacher_type if args.teacher_type is not None else config.teacher_type
         student_type = args.student_type if args.student_type is not None else config.student_type
@@ -418,6 +471,16 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             config,
             hf_teacher=replace(config.hf_teacher, model_name_or_path=args.teacher_model_name_or_path),
         )
+    if not args.mock and getattr(args, "dataset_type", None) is not None:
+        config = replace(config, data=replace(config.data, dataset_type=_normalize_dataset_type(args.dataset_type)))
+    if not args.mock and getattr(args, "data_path", None) is not None:
+        config = replace(config, data=replace(config.data, path=args.data_path))
+    if not args.mock and getattr(args, "tokenizer_name_or_path", None) is not None:
+        config = replace(config, data=replace(config.data, tokenizer_name_or_path=args.tokenizer_name_or_path))
+    if not args.mock and getattr(args, "max_examples", None) is not None:
+        config = replace(config, data=replace(config.data, max_examples=args.max_examples))
+    if not args.mock and getattr(args, "text_field", None) is not None:
+        config = replace(config, data=replace(config.data, text_field=args.text_field))
     if getattr(args, "student_model_name_or_path", None) is not None:
         config = replace(
             config,
@@ -457,9 +520,10 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
             config,
             hf_teacher=replace(config.hf_teacher, local_files_only=True),
             mamba_student=replace(config.mamba_student, local_files_only=True),
+            data=replace(config.data, local_files_only=True),
         )
     if args.seq_len is not None:
-        config = replace(config, mock=replace(config.mock, seq_len=args.seq_len))
+        config = replace(config, mock=replace(config.mock, seq_len=args.seq_len), data=replace(config.data, seq_len=args.seq_len))
     if args.batch_size is not None:
         config = replace(config, mock=replace(config.mock, batch_size=args.batch_size))
     if args.gradient_accumulation_steps is not None:
@@ -492,6 +556,8 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, teacher_cache=replace(config.teacher_cache, top_k=args.teacher_cache_top_k))
     if config.student_type == "mamba" and config.teacher_type == "mock":
         config = replace(config, mock=replace(config.mock, vocab_size=config.mamba_student.vocab_size))
+    if config.teacher_type == "hf" and config.data.dataset_type != "mock" and config.data.tokenizer_name_or_path is None:
+        config = replace(config, data=replace(config.data, tokenizer_name_or_path=config.hf_teacher.model_name_or_path))
     return config
 
 
@@ -656,6 +722,69 @@ def _training_device(config: TrainConfig) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _tokenizer_vocab_size(tokenizer: Any) -> int:
+    try:
+        return int(len(tokenizer))
+    except TypeError:
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if vocab_size is None:
+            raise ValueError("Tokenizer must expose __len__ or vocab_size for smoke training.")
+        return int(vocab_size)
+
+
+def _load_training_tokenizer(config: TrainConfig) -> Any | None:
+    if config.data.dataset_type == "mock":
+        return None
+    tokenizer_name_or_path = config.data.tokenizer_name_or_path
+    if tokenizer_name_or_path is None and config.teacher_type == "hf":
+        tokenizer_name_or_path = config.hf_teacher.model_name_or_path
+    tokenizer = load_tokenizer(
+        TokenizerConfig(
+            tokenizer_name_or_path=tokenizer_name_or_path,
+            use_fast=config.data.use_fast,
+            trust_remote_code=config.data.trust_remote_code,
+            local_files_only=config.data.local_files_only,
+            pad_token_strategy=config.data.pad_token_strategy,
+        )
+    )
+    return tokenizer
+
+
+def _build_training_dataset(
+    config: TrainConfig,
+    *,
+    tokenizer: Any | None,
+    vocab_size: int,
+) -> torch.utils.data.Dataset[dict[str, Tensor]]:
+    if config.data.dataset_type == "mock":
+        return MockTextDataset(
+            vocab_size=vocab_size,
+            seq_len=config.mock.seq_len,
+            num_samples=config.mock.num_samples,
+            seed=config.seed,
+            ignore_index=config.mock.ignore_index,
+        )
+    if tokenizer is None:
+        raise ValueError("Tokenizer is required for text/jsonl datasets.")
+    if config.data.path is None:
+        raise ValueError("--data-path or data.path is required for text/jsonl datasets.")
+    return TokenizedTextDataset(
+        tokenizer=tokenizer,
+        config=TextDatasetConfig(
+            path=config.data.path,
+            seq_len=config.data.seq_len,
+            stride=config.data.stride,
+            max_examples=config.data.max_examples,
+            seed=config.data.seed,
+            add_eos=config.data.add_eos,
+            shuffle=config.data.shuffle,
+            file_format=config.data.dataset_type,
+            text_field=config.data.text_field,
+            ignore_index=config.mock.ignore_index,
+        ),
+    )
+
+
 def _teacher_vocab_size(teacher: MockTeacherWrapper | HuggingFaceTeacherWrapper) -> int:
     if isinstance(teacher, MockTeacherWrapper):
         return int(teacher.embedding.num_embeddings)
@@ -815,20 +944,32 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
 
     set_seed(config.seed)
     device = _training_device(config)
+    tokenizer = _load_training_tokenizer(config)
+    if tokenizer is not None:
+        tokenizer_vocab_size = _tokenizer_vocab_size(tokenizer)
+        if tokenizer_vocab_size <= 1:
+            raise ValueError(f"tokenizer vocab size must be greater than 1, got {tokenizer_vocab_size}.")
+        if config.data.dataset_type != "mock":
+            config = replace(config, mock=replace(config.mock, vocab_size=tokenizer_vocab_size))
     teacher = _build_teacher(config, device)
     teacher_vocab_size = _teacher_vocab_size(teacher)
     if teacher_vocab_size <= 1:
         raise ValueError(f"teacher vocab_size must be greater than 1, got {teacher_vocab_size}.")
+    if tokenizer is not None:
+        tokenizer_vocab_size = _tokenizer_vocab_size(tokenizer)
+        if tokenizer_vocab_size != teacher_vocab_size:
+            raise ValueError(
+                "tokenizer and teacher vocab sizes must match for real text smoke training: "
+                f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}."
+            )
     _validate_teacher_student_vocab(config, teacher_vocab_size)
 
-    dataset = MockTextDataset(
+    dataset = _build_training_dataset(
+        config,
+        tokenizer=tokenizer,
         vocab_size=teacher_vocab_size,
-        seq_len=config.mock.seq_len,
-        num_samples=config.mock.num_samples,
-        seed=config.seed,
-        ignore_index=config.mock.ignore_index,
     )
-    loader = DataLoader(dataset, batch_size=config.mock.batch_size, shuffle=False, drop_last=True)
+    loader = DataLoader(dataset, batch_size=config.mock.batch_size, shuffle=False, drop_last=False)
     batches = infinite_loader(loader)
 
     student = _build_student(config, teacher_vocab_size, device)
@@ -846,7 +987,11 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
             batch = next(batches)
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
-            attention_mask = torch.ones_like(input_ids) if config.teacher_type == "hf" else None
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            elif config.teacher_type == "hf":
+                attention_mask = torch.ones_like(input_ids)
             with autocast_context:
                 if teacher_cache is None:
                     teacher_logits = teacher(input_ids, attention_mask=attention_mask)

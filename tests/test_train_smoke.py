@@ -350,6 +350,11 @@ config = train.derive_runtime_config(
         teacher_type="hf",
         student_type="mamba",
         teacher_model_name_or_path="forbidden-teacher",
+        dataset_type="text",
+        data_path="forbidden.txt",
+        tokenizer_name_or_path="forbidden-tokenizer",
+        max_examples=1,
+        text_field="text",
         student_model_name_or_path="forbidden-student",
         student_vocab_size=None,
         student_hidden_size=None,
@@ -380,6 +385,7 @@ config = train.derive_runtime_config(
         load_in_4bit=False,
     )
 )
+assert config.data.dataset_type == "mock"
 train.run_training(config, max_steps=1)
 assert calls == {"hf_teacher": 0, "real_mamba": 0}
 """
