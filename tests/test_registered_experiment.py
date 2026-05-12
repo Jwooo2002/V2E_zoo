@@ -84,6 +84,7 @@ def test_run_registered_experiment_executes_mock_smoke_under_run_dir(tmp_path: P
             "--with-eval",
             "--with-perturbation",
             "--with-needle",
+            "--with-report",
         ],
         cwd=ROOT,
         text=True,
@@ -96,6 +97,7 @@ def test_run_registered_experiment_executes_mock_smoke_under_run_dir(tmp_path: P
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["metadata"]["status"] == "success"
     assert manifest["metadata"]["returncodes"]["train"] == 0
+    assert manifest["metadata"]["returncodes"]["report"] == 0
     assert (run_dir / "logs" / "train.stdout").is_file()
     assert (run_dir / "logs" / "train.stderr").is_file()
     assert (run_dir / "checkpoints").is_dir()
@@ -103,6 +105,9 @@ def test_run_registered_experiment_executes_mock_smoke_under_run_dir(tmp_path: P
     assert (run_dir / "evals" / "eval.json").is_file()
     assert (run_dir / "evals" / "perturbation.json").is_file()
     assert (run_dir / "evals" / "needle.json").is_file()
+    assert (run_dir / "reports" / "report.json").is_file()
+    assert (run_dir / "reports" / "report.csv").is_file()
+    assert (run_dir / "reports" / "report.md").is_file()
     assert str(run_dir / "checkpoints") in " ".join(manifest["command"])
     assert str(run_dir / "cache" / "teacher_logits") in " ".join(manifest["command"])
 

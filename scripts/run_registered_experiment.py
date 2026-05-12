@@ -38,6 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiment", type=Path, required=True)
     parser.add_argument("--base-output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--stage", default="8E")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-dirty-git", action="store_true")
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -134,15 +135,19 @@ def _needle_command(run_dir: Path) -> list[str]:
 
 
 def _report_command(run_dir: Path) -> list[str]:
-    eval_json = run_dir / "evals" / "eval.json"
     command = [
         sys.executable,
         str(ROOT / "scripts" / "summarize_results.py"),
         "--output-dir",
         str(run_dir / "reports"),
     ]
-    if eval_json.is_file():
-        command.extend(["--eval-json", str(eval_json)])
+    for name, eval_json in (
+        ("eval", run_dir / "evals" / "eval.json"),
+        ("perturbation", run_dir / "evals" / "perturbation.json"),
+        ("needle", run_dir / "evals" / "needle.json"),
+    ):
+        if eval_json.is_file():
+            command.extend(["--eval-json", f"{name}={eval_json}"])
     return command
 
 
@@ -169,7 +174,7 @@ def _manifest(
         run_id=run_id,
         created_at=datetime.now(timezone.utc).isoformat(),
         project="cdm-mamba-kd",
-        stage="8E",
+        stage=str(args.stage),
         command=commands[0] if commands else [],
         config_paths=[str(args.experiment)],
         output_dir=str(run_dir),

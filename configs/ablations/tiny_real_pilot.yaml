@@ -1,0 +1,54 @@
+experiment_name: tiny_real_pilot
+
+base:
+  config: configs/train_config.yaml
+  mock: false
+  teacher_type: hf
+  student_type: mamba
+  teacher_model_name_or_path: sshleifer/tiny-gpt2
+  tokenizer_name_or_path: sshleifer/tiny-gpt2
+  local_files_only: true
+  dataset_type: text
+  data_path: data/smoke.txt
+  seq_len: 16
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 20
+  student_hidden_size: 64
+  student_num_layers: 2
+  mixed_precision: "no"
+  top_k: 128
+  teacher_cache_enabled: true
+  teacher_cache_dir: /tmp/csdm_tiny_pilot/cache
+  checkpoint_output_dir: /tmp/csdm_tiny_pilot/checkpoints
+  save_at_end: true
+
+variants:
+  - name: ce_only
+    requires_mamba: true
+    ce_weight: 1.0
+    kd_weight: 0.0
+    csdm_weight: 0.0
+    topk_enabled: false
+
+  - name: ce_kd
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.0
+    topk_enabled: false
+
+  - name: ce_kd_csdm
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+    topk_enabled: false
+
+  - name: ce_kd_csdm_topk
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+    topk_enabled: true
+    top_k: 128

@@ -16,7 +16,8 @@ alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
 small-experiment runner support, Stage 7E distributed 2x4090 preparation,
 Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
 perturbation robustness benchmarking, Stage 8D synthetic
-Needle-in-a-Haystack benchmarking, and Stage 8E run registry tooling:
+Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, and Stage
+9A tiny real pilot configs:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -78,6 +79,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   `manifest.json` without executing training.
 - `scripts/run_registered_experiment.py`: wraps a small experiment in a run
   directory with logs, checkpoints, cache, eval outputs, and manifest metadata.
+- `scripts/run_tiny_pilot.py`: Stage 9A convenience runner for tiny real
+  CE/KD/CSDM pilot variants through the run registry.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -121,6 +124,10 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   HF-teacher/real-Mamba distributed smoke template.
 - `configs/ablations/csdm_mamba_smoke.yaml`: small CE/KD/CSDM/top-k and
   optional real-Mamba perturbation ablation matrix.
+- `configs/pilots/tiny_real_*.yaml`: Stage 9A local-files-only tiny real
+  pilot templates for CE, KD, CSDM, and CSDM top-k variants.
+- `configs/ablations/tiny_real_pilot.yaml`: Stage 9A tiny real pilot matrix
+  for the same CE/KD/CSDM/top-k comparison.
 - `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
@@ -830,6 +837,45 @@ writes `manifest.json` with `run_id`, command, copied configs, git status,
 Python/Torch/CUDA package metadata, run status, and return codes. Optional
 dependencies are detected through package metadata where possible and are not
 required for mock/offline tests.
+
+## Stage 9A Tiny Real Pilot Configs
+
+Stage 9A adds small, reproducible pilot configurations that exercise the full
+pipeline with local text data, a HuggingFace teacher, a real Mamba student,
+top-k, teacher cache, checkpointing, and the run registry. These are
+smoke-scale pilots, not paper-final experiments, and they do not change
+CE/KD/CSDM math or teacher behavior.
+
+The four pilot variants are:
+
+- `ce`: CE only.
+- `kd`: CE + on-trajectory KD.
+- `csdm`: CE + KD + CSDM.
+- `csdm_topk`: CE + KD + CSDM with top-k KD/CSDM enabled.
+
+All pilot configs default to `local_files_only: true`, so actual runs require
+cached HuggingFace artifacts or local model/tokenizer paths. Pass
+`--allow-downloads` only when downloads are intentional. Dry-run all variants:
+
+```bash
+python scripts/run_tiny_pilot.py --variant all --dry-run
+```
+
+Run the top-k CSDM pilot if HF artifacts and `mamba_ssm` are available:
+
+```bash
+python scripts/run_tiny_pilot.py \
+  --variant csdm_topk \
+  --base-output-dir /tmp/csdm_tiny_pilot \
+  --max-steps 20 \
+  --with-perturbation \
+  --with-needle \
+  --with-report
+```
+
+The runner delegates to `scripts/run_registered_experiment.py`, so each pilot
+gets a run directory with `manifest.json`, copied configs, logs, checkpoints,
+teacher-cache outputs, optional eval artifacts, and reports.
 
 ## Stage 6B Mamba Dependency Diagnostics
 
