@@ -21,6 +21,7 @@ from scripts.run_small_experiment import (  # noqa: E402
     build_command,
     load_experiment,
     shell_join,
+    validate_execution_paths,
 )
 from utils.manifest import (  # noqa: E402
     RunManifest,
@@ -278,6 +279,7 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
         (run_dir / "logs" / "planned_command.txt").write_text(shell_join(train_command) + "\n", encoding="utf-8")
         print(shell_join(train_command), flush=True)
     else:
+        validate_execution_paths(experiment_config)
         train_code = _run_command(
             train_command,
             stdout_path=run_dir / "logs" / "train.stdout",

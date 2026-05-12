@@ -18,7 +18,8 @@ Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
 perturbation robustness benchmarking, Stage 8D synthetic
 Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, Stage 9A
 tiny real pilot configs, Stage 9B checkpoint-backed registered evaluation,
-and Stage 9C dual full-vocab/top-k perturbation reporting:
+Stage 9C dual full-vocab/top-k perturbation reporting, and Stage 10A
+real-small training configs:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -967,6 +968,58 @@ python scripts/run_tiny_pilot.py \
   --with-perturbation \
   --with-report
 ```
+
+## Stage 10A Real-Small Training Configs
+
+Stage 10A adds reusable real-small training presets for the first 1k-step local
+text runs. This is config/orchestration only: CE/KD/CSDM math, teacher
+behavior, and Mamba internals are unchanged.
+
+The presets target:
+
+- HF teacher/tokenizer: `sshleifer/tiny-gpt2`
+- real Mamba student: hidden size 128, 4 layers
+- local plain-text corpus from `CSDM_DATA_PATH`
+- sequence length 128, batch size 1, gradient accumulation 16
+- teacher cache, checkpointing every 100 optimizer steps, final checkpoint
+- variants: KD, KD+CSDM, KD+CSDM+top-k
+
+Set a local corpus path before running real training:
+
+```bash
+export CSDM_DATA_PATH=/path/to/real_corpus.txt
+```
+
+Use a 10MB+ plain-text file for the first useful sanity run. The configs keep
+`local_files_only: true`, so the HF model and tokenizer must already be cached
+or replaced with local paths. Dry-runs do not require the corpus file.
+
+Recommended first command:
+
+```bash
+python scripts/run_registered_experiment.py \
+  --experiment configs/experiments/train_real_small_csdm_topk.yaml \
+  --base-output-dir /tmp/csdm_real_small_runs \
+  --override max_steps=1000 \
+  --with-perturbation \
+  --with-report
+```
+
+Ablation dry-run/execution:
+
+```bash
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/real_small_training.yaml \
+  --dry-run
+
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/real_small_training.yaml \
+  --output-dir /tmp/csdm_real_small_ablation
+```
+
+Suggested scaling: `1000` steps for sanity, `5000` for a small ablation, and
+`20000` for a more serious pilot once cache, checkpoints, and perturbation
+reports look sane.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -90,6 +92,16 @@ BOOLEAN_OPTIONAL_KEYS = {
 }
 
 STORE_TRUE_KEYS = {"mock", "local_files_only"}
+ENV_VAR_PATTERN = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))")
+ENV_EXPAND_KEYS = {
+    "data_path",
+    "teacher_cache_dir",
+    "checkpoint_output_dir",
+    "resume_from",
+    "teacher_model_name_or_path",
+    "student_model_name_or_path",
+    "tokenizer_name_or_path",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,7 +150,7 @@ def load_experiment(path: Path, overrides: list[str] | None = None) -> dict[str,
     if not isinstance(loaded, dict):
         raise ValueError("Experiment YAML must contain a flat mapping.")
 
-    config = dict(loaded)
+    config = expand_env_vars(dict(loaded))
     config = apply_overrides(config, overrides or [])
 
     _validate_flat_config(config)
@@ -147,12 +159,58 @@ def load_experiment(path: Path, overrides: list[str] | None = None) -> dict[str,
     return config
 
 
+def expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
+    """Expand environment variables in flat string values.
+
+    Unset variables intentionally remain as ``$VAR``/``${VAR}`` so dry-runs can
+    show the unresolved placeholder without requiring the local corpus.
+    """
+
+    expanded: dict[str, Any] = {}
+    for key, value in config.items():
+        expanded[key] = os.path.expandvars(value) if key in ENV_EXPAND_KEYS and isinstance(value, str) else value
+    return expanded
+
+
 def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
     merged = dict(config)
     for raw_override in overrides:
         key, value = parse_override(raw_override)
+        if key in ENV_EXPAND_KEYS and isinstance(value, str):
+            value = os.path.expandvars(value)
         merged[key] = value
     return merged
+
+
+def unresolved_env_vars(value: str) -> list[str]:
+    """Return unresolved shell-style environment variable names in ``value``."""
+
+    unresolved: list[str] = []
+    for match in ENV_VAR_PATTERN.finditer(value):
+        name = match.group("braced") or match.group("bare")
+        if name and name not in os.environ:
+            unresolved.append(name)
+    return unresolved
+
+
+def validate_execution_paths(config: dict[str, Any]) -> None:
+    """Validate local file paths required for non-dry-run real-data execution."""
+
+    if config.get("dataset_type") not in {"text", "jsonl"}:
+        return
+    data_path = config.get("data_path")
+    if not isinstance(data_path, str) or not data_path:
+        raise ValueError("dataset_type text/jsonl requires data_path.")
+    unresolved = unresolved_env_vars(data_path)
+    if unresolved:
+        names = ", ".join(sorted(set(unresolved)))
+        raise ValueError(
+            f"data_path contains unresolved environment variable(s): {names}. "
+            "Set CSDM_DATA_PATH or override data_path before execution."
+        )
+    resolved_path = Path(data_path).expanduser()
+    if not resolved_path.is_file():
+        raise ValueError(f"data_path does not exist: {resolved_path}")
 
 
 def _bool_flag(flag: str, value: Any) -> list[str]:
@@ -208,6 +266,10 @@ def main() -> None:
     print(shell_join(command), flush=True)
     if args.dry_run:
         return
+    try:
+        validate_execution_paths(config)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     raise SystemExit(subprocess.run(command, cwd=ROOT).returncode)
 
 

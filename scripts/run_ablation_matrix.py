@@ -23,8 +23,10 @@ from scripts.run_small_experiment import (  # noqa: E402
     KEY_TO_FLAG,
     apply_overrides,
     build_command,
+    expand_env_vars,
     parse_override,
     shell_join,
+    validate_execution_paths,
 )
 
 
@@ -83,8 +85,9 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
 
 def load_matrix(path: Path) -> dict[str, Any]:
     matrix = _load_yaml_mapping(path)
-    base = matrix.get("base", {})
+    base = expand_env_vars(matrix.get("base", {}))
     variants = matrix.get("variants", [])
+    matrix["base"] = base
     if not isinstance(base, dict):
         raise ValueError("Ablation matrix 'base' must be a mapping.")
     if not isinstance(variants, list):
@@ -312,6 +315,22 @@ def run_variant(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             reason=reason,
+        )
+
+    try:
+        validate_execution_paths(config)
+    except ValueError as exc:
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text(str(exc) + "\n", encoding="utf-8")
+        return _record(
+            name=name,
+            status="failed",
+            command=command,
+            returncode=1,
+            metrics={},
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            reason=str(exc),
         )
 
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
