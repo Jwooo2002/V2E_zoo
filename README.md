@@ -13,8 +13,9 @@ dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
 local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
 alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
-small-experiment runner support, Stage 7E distributed 2x4090 preparation, and
-Stage 8A ablation matrix orchestration:
+small-experiment runner support, Stage 7E distributed 2x4090 preparation,
+Stage 8A ablation matrix orchestration, Stage 8B result reporting, and
+Stage 8C perturbation robustness benchmarking:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -48,6 +49,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   logging/checkpointing, rank-local cache paths, and metric averaging.
 - `utils/mamba_env.py`: optional real-Mamba dependency diagnostics with lazy
   checks for `mamba_ssm` and `causal-conv1d`.
+- `utils/results.py`: Stage 8B result aggregation helpers for flattening
+  ablation/evaluation metrics and exporting JSON, CSV, and Markdown tables.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
 - `scripts/check_mamba_forward.py`: opt-in Stage 6C-6E real-Mamba forward
   smoke check with tiny config-driven dimensions, state/off-state reporting,
@@ -59,6 +62,12 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `scripts/run_ablation_matrix.py`: Stage 8A ablation runner that expands
   matrix YAML variants into `train.py` commands, captures per-variant logs,
   parses JSON training metrics, and writes JSON/CSV summaries.
+- `scripts/summarize_results.py`: Stage 8B report exporter that combines
+  Stage 8A ablation summaries and optional `evaluate.py` JSON metrics into
+  `report.json`, `report.csv`, and `report.md`.
+- `scripts/run_perturbation_benchmark.py`: Stage 8C benchmark CLI for
+  `KL_on`, `KL_off`, `Delta_KL`, optional top-k approximation, position-wise
+  reporting, and perturbation-mode sweeps.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -639,6 +648,89 @@ the Stage 6F real-Mamba CSDM smoke guard still permits CSDM only for the
 `delta_projection` off-state approximation. This is not final paper-scale
 evaluation; it is a repeatable smoke-scale harness for comparing loss and
 perturbation settings.
+
+## Stage 8B Result Reporting
+
+Stage 8B is post-hoc reporting only. It reads existing ablation summaries and
+optional evaluation JSON outputs, then writes compact research-note tables. It
+does not construct models, call teachers/students, or change CE/KD/CSDM math.
+
+Summarize an ablation run:
+
+```bash
+python scripts/summarize_results.py \
+  --ablation-summary /tmp/csdm_ablation_smoke/ablation_summary.json \
+  --output-dir /tmp/csdm_report \
+  --print-markdown
+```
+
+Attach mock evaluation metrics to one variant:
+
+```bash
+python evaluate.py --config configs/train_config.yaml --mock --mode all --max_batches 2 > /tmp/mock_eval.json
+python scripts/summarize_results.py \
+  --ablation-summary /tmp/csdm_ablation_smoke/ablation_summary.json \
+  --eval-json ce_kd=/tmp/mock_eval.json \
+  --output-dir /tmp/csdm_report_eval \
+  --print-markdown
+```
+
+Report outputs:
+
+- `report.json`
+- `report.csv`
+- `report.md`
+
+Key metrics:
+
+- `total`, `ce`, `kd`, `csdm`: training losses from JSON logs;
+- `perplexity.loss` and `perplexity.perplexity`: lower is better;
+- `perturbation.delta_kl = kl_off - kl_on`: lower is better for
+  off-trajectory robustness;
+- `needle.accuracy`: higher is better, but the current needle scaffold is
+  synthetic mock bookkeeping rather than real long-context evidence.
+
+## Stage 8C Perturbation Robustness Benchmark
+
+Stage 8C is evaluation-only. It does not train, alter CE/KD/CSDM math, change
+teacher behavior, or reach into private Mamba internals. The benchmark compares
+the same frozen clean-prefix teacher distribution against student logits before
+and after the student-side off-trajectory perturbation:
+
+- `KL_on = KL(p_teacher || p_student_on)`
+- `KL_off = KL(p_teacher || p_student_off)`
+- `Delta_KL = KL_off - KL_on`
+
+Lower `Delta_KL` is better because it means less degradation after moving from
+`h_t` to `h'_t`. Negative values are possible and are not clamped.
+
+Mock benchmark with position-wise output:
+
+```bash
+python scripts/run_perturbation_benchmark.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max-batches 2 \
+  --position-wise
+```
+
+Mode sweep with JSON/CSV output:
+
+```bash
+python scripts/run_perturbation_benchmark.py \
+  --config configs/train_config.yaml \
+  --mock \
+  --max-batches 2 \
+  --sweep delta_projection,noise,identity \
+  --output-json /tmp/csdm_perturb.json \
+  --output-csv /tmp/csdm_perturb.csv
+```
+
+Use `--topk-enabled --top-k 128` to report the selected-vocab approximation.
+Top-k indices are built from detached clean teacher logits only, then applied to
+teacher/on/off logits consistently. The teacher still consumes only clean
+`input_ids` and optional `attention_mask`; it never consumes `h_t`, `h'_t`,
+`h_delta_alt`, or perturbed token inputs.
 
 ## Stage 6B Mamba Dependency Diagnostics
 
