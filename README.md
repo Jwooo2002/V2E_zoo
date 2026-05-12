@@ -13,7 +13,8 @@ dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
 local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
 alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
-small-experiment runner support, and Stage 7E distributed 2x4090 preparation:
+small-experiment runner support, Stage 7E distributed 2x4090 preparation, and
+Stage 8A ablation matrix orchestration:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -55,6 +56,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   YAML configs to the existing `train.py` CLI, supports `--dry-run` and
   repeated `--override key=value`, prints the subprocess command, and rejects
   unknown keys.
+- `scripts/run_ablation_matrix.py`: Stage 8A ablation runner that expands
+  matrix YAML variants into `train.py` commands, captures per-variant logs,
+  parses JSON training metrics, and writes JSON/CSV summaries.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -95,6 +99,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   template.
 - `configs/experiments/smoke_2x4090_real_mamba.yaml`: local-files-only
   HF-teacher/real-Mamba distributed smoke template.
+- `configs/ablations/csdm_mamba_smoke.yaml`: small CE/KD/CSDM/top-k and
+  optional real-Mamba perturbation ablation matrix.
 - `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
@@ -587,6 +593,52 @@ python scripts/run_small_experiment.py \
   --experiment configs/experiments/smoke_2x4090_mock.yaml \
   --dry-run
 ```
+
+## Stage 8A Ablation Matrix Runner
+
+Stage 8A adds small-scale experiment orchestration only. It does not change
+CE, KD, CSDM, teacher inputs, or Mamba internals. The default matrix isolates
+the ablations needed to evaluate the CSDM-Mamba contribution:
+
+- CE only;
+- CE + on-trajectory KD;
+- CE + KD + off-trajectory CSDM;
+- full-vocab versus top-k KD/CSDM;
+- optional real-Mamba perturbation variants for `noise` and
+  `delta_projection` student-side off-state construction.
+
+Dry-run the matrix without training:
+
+```bash
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/csdm_mamba_smoke.yaml \
+  --dry-run
+```
+
+Run a small mock-only subset:
+
+```bash
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/csdm_mamba_smoke.yaml \
+  --only ce_only \
+  --only ce_kd \
+  --output-dir /tmp/csdm_ablation_run
+```
+
+Outputs are written under the selected output directory:
+
+- `ablation_summary.json`
+- `ablation_summary.csv`
+- `logs/<variant>.stdout`
+- `logs/<variant>.stderr`
+
+Real-Mamba variants are marked optional. If `mamba_ssm` is unavailable, the
+runner records them as skipped instead of requiring the dependency for offline
+mock tests. The `perturb_noise` entry is currently declared but skipped because
+the Stage 6F real-Mamba CSDM smoke guard still permits CSDM only for the
+`delta_projection` off-state approximation. This is not final paper-scale
+evaluation; it is a repeatable smoke-scale harness for comparing loss and
+perturbation settings.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

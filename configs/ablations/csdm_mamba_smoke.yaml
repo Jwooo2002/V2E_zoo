@@ -1,0 +1,71 @@
+experiment_name: csdm_mamba_smoke
+
+base:
+  config: configs/train_config.yaml
+  mock: true
+  teacher_type: mock
+  student_type: mock
+  dataset_type: mock
+  seq_len: 16
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  mixed_precision: "no"
+  checkpoint_output_dir: /tmp/csdm_ablation_ckpt
+  teacher_cache_dir: /tmp/csdm_ablation_cache
+  save_at_end: false
+
+variants:
+  - name: ce_only
+    ce_weight: 1.0
+    kd_weight: 0.0
+    csdm_weight: 0.0
+    topk_enabled: false
+
+  - name: ce_kd
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.0
+    topk_enabled: false
+
+  - name: ce_kd_csdm
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+    topk_enabled: false
+
+  - name: ce_kd_csdm_topk
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+    topk_enabled: true
+    top_k: 128
+
+  - name: perturb_noise
+    skip_reason: "Stage 6F real-Mamba CSDM smoke currently allows delta_projection only; keep this as a declared future noise-perturbation ablation."
+    requires_mamba: true
+    mock: false
+    student_type: mamba
+    teacher_type: mock
+    student_hidden_size: 64
+    student_num_layers: 2
+    delta_alt_mode: noise
+    off_state_mode: projection
+    off_logits_mode: lm_head
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+
+  - name: perturb_delta_projection
+    requires_mamba: true
+    mock: false
+    student_type: mamba
+    teacher_type: mock
+    student_hidden_size: 64
+    student_num_layers: 2
+    delta_alt_mode: delta_projection
+    off_state_mode: projection
+    off_logits_mode: lm_head
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
