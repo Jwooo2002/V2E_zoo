@@ -15,8 +15,8 @@ local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
 alignment hardening, Stage 7C checkpoint/resume hardening, Stage 7D
 small-experiment runner support, Stage 7E distributed 2x4090 preparation,
 Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
-perturbation robustness benchmarking, and Stage 8D synthetic
-Needle-in-a-Haystack benchmarking:
+perturbation robustness benchmarking, Stage 8D synthetic
+Needle-in-a-Haystack benchmarking, and Stage 8E run registry tooling:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -52,6 +52,8 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   checks for `mamba_ssm` and `causal-conv1d`.
 - `utils/results.py`: Stage 8B result aggregation helpers for flattening
   ablation/evaluation metrics and exporting JSON, CSV, and Markdown tables.
+- `utils/manifest.py`: Stage 8E run manifest helpers for run IDs, git/env
+  metadata, config snapshots, and registry directory creation.
 - `scripts/check_mamba_env.py`: CLI wrapper for the Stage 6B dependency report.
 - `scripts/check_mamba_forward.py`: opt-in Stage 6C-6E real-Mamba forward
   smoke check with tiny config-driven dimensions, state/off-state reporting,
@@ -72,6 +74,10 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `scripts/run_needle_benchmark.py`: Stage 8D synthetic Needle-in-a-Haystack
   benchmark CLI with deterministic context/position sweeps, oracle/wrong mock
   predictors, and JSON/CSV exports.
+- `scripts/create_run_manifest.py`: creates a run directory and
+  `manifest.json` without executing training.
+- `scripts/run_registered_experiment.py`: wraps a small experiment in a run
+  directory with logs, checkpoints, cache, eval outputs, and manifest metadata.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -774,6 +780,56 @@ one row per generated example with `example_id`, `context_length`, `position`,
 `answer`, `prediction`, `exact`, and `contains`. The existing
 `evaluate.py --mock --mode needle` command remains a compact legacy scaffold
 that returns the original five fields used by smoke tests.
+
+## Stage 8E Experiment Manifest And Run Registry
+
+Stage 8E is reproducibility/reporting tooling only. It does not change
+CE/KD/CSDM math, teacher behavior, Mamba internals, or cache keys. The registry
+organizes command history, config snapshots, git metadata, environment
+metadata, logs, checkpoints, cache outputs, evaluations, reports, and artifacts
+under one run directory:
+
+```text
+runs/<run_id>/
+  manifest.json
+  configs/
+  logs/
+  checkpoints/
+  cache/
+    teacher_logits/
+  reports/
+  evals/
+  artifacts/
+```
+
+Create a manifest-only run directory:
+
+```bash
+python scripts/create_run_manifest.py \
+  --output-dir /tmp/csdm_runs \
+  --stage 8E \
+  --config configs/experiments/smoke_mock.yaml \
+  --print-path
+```
+
+Run the mock smoke experiment inside a registry directory:
+
+```bash
+python scripts/run_registered_experiment.py \
+  --experiment configs/experiments/smoke_mock.yaml \
+  --base-output-dir /tmp/csdm_runs \
+  --override max_steps=1 \
+  --with-eval \
+  --with-perturbation \
+  --with-needle
+```
+
+The registered runner injects checkpoint and teacher-cache paths under the run
+directory unless explicitly overridden. It captures stdout/stderr logs and
+writes `manifest.json` with `run_id`, command, copied configs, git status,
+Python/Torch/CUDA package metadata, run status, and return codes. Optional
+dependencies are detected through package metadata where possible and are not
+required for mock/offline tests.
 
 ## Stage 6B Mamba Dependency Diagnostics
 
