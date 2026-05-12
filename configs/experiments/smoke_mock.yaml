@@ -1,0 +1,17 @@
+config: configs/train_config.yaml
+mock: true
+teacher_type: mock
+student_type: mock
+dataset_type: mock
+max_steps: 2
+seq_len: 16
+batch_size: 1
+gradient_accumulation_steps: 1
+mixed_precision: "no"
+csdm_weight: 0.03
+topk_enabled: true
+top_k: 128
+teacher_cache_enabled: true
+teacher_cache_dir: /tmp/csdm_smoke_mock_cache
+checkpoint_output_dir: /tmp/csdm_smoke_mock_ckpt
+save_at_end: true

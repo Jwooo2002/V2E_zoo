@@ -356,6 +356,7 @@ def test_train_mock_strict_resume_rejects_config_metadata_mismatch(tmp_path: Pat
 
     assert result.returncode != 0
     assert "Checkpoint config snapshot is incompatible" in result.stderr
+    assert "mock.batch_size" in result.stderr
 
 
 def _small_cache_config(tmp_path: Path, *, overwrite: bool = False, use_top_k: bool = False) -> train_module.TrainConfig:

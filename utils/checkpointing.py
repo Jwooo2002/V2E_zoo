@@ -114,7 +114,7 @@ def load_training_checkpoint(
     should_restore_rng = load_rng_state if restore_rng is None else restore_rng
     if should_restore_rng:
         if "rng_state" not in payload:
-            raise KeyError("training checkpoint is missing rng_state.")
+            raise ValueError("training checkpoint is missing rng_state.")
         _restore_rng_state(payload["rng_state"])
 
     metadata = payload.get("metadata") or {}
@@ -155,44 +155,100 @@ def _checkpoint_sort_key(path: Path) -> tuple[int, int, float]:
 
 def _capture_rng_state() -> dict[str, Any]:
     python_state = random.getstate()
-    torch_state = torch.get_rng_state()
+    torch_state = _as_cpu_uint8_rng_tensor(torch.get_rng_state(), key="torch_cpu")
     state: dict[str, Any] = {
-        "python_random_state": python_state,
-        "torch_rng_state": torch_state,
-        "python": python_state,
-        "torch": torch_state,
+        "torch_cpu": torch_state,
+        "torch_cuda": None,
+        "python_random": python_state,
+        "numpy_random": None,
     }
     if torch.cuda.is_available():
-        cuda_state = torch.cuda.get_rng_state_all()
-        state["cuda_rng_state_all"] = cuda_state
-        state["cuda"] = cuda_state
+        state["torch_cuda"] = [
+            _as_cpu_uint8_rng_tensor(cuda_state, key=f"torch_cuda[{index}]")
+            for index, cuda_state in enumerate(torch.cuda.get_rng_state_all())
+        ]
     try:
         import numpy as np
     except ImportError:
-        state["numpy_random_state"] = None
+        pass
     else:
-        numpy_state = np.random.get_state()
-        state["numpy_random_state"] = numpy_state
-        state["numpy"] = numpy_state
+        state["numpy_random"] = np.random.get_state()
     return state
 
 
 def _restore_rng_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
-        raise TypeError("rng_state must be a dict.")
-    python_state = state.get("python_random_state", state.get("python"))
+        raise ValueError("rng_state must be a dict.")
+    torch_state = _get_first_present(state, ("torch_cpu", "torch_rng_state", "torch"))
+    if torch_state is None:
+        raise ValueError("rng_state is missing torch_cpu.")
+    torch.set_rng_state(_as_cpu_uint8_rng_tensor(torch_state, key="torch_cpu"))
+
+    cuda_state = _get_first_present(state, ("torch_cuda", "cuda_rng_state_all", "cuda"))
+    if cuda_state is not None:
+        cuda_states = _normalize_cuda_rng_states(cuda_state)
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if len(cuda_states) != device_count:
+                raise ValueError(
+                    "rng_state['torch_cuda'] contains "
+                    f"{len(cuda_states)} state(s), but CUDA reports {device_count} device(s)."
+                )
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    python_state = state.get(
+        "python_random",
+        state.get("python_random_state", state.get("python")),
+    )
     if python_state is not None:
         random.setstate(python_state)
-    torch_state = state.get("torch_rng_state", state.get("torch"))
-    if torch_state is not None:
-        torch.set_rng_state(torch_state.cpu() if hasattr(torch_state, "cpu") else torch_state)
-    cuda_state = state.get("cuda_rng_state_all", state.get("cuda"))
-    if torch.cuda.is_available() and cuda_state is not None:
-        torch.cuda.set_rng_state_all(cuda_state)
-    numpy_state = state.get("numpy_random_state", state.get("numpy"))
+
+    numpy_state = state.get("numpy_random", state.get("numpy_random_state", state.get("numpy")))
     if numpy_state is not None:
         try:
             import numpy as np
         except ImportError:
             return
         np.random.set_state(numpy_state)
+
+
+def _get_first_present(state: dict[str, Any], keys: tuple[str, ...]) -> Any | None:
+    for key in keys:
+        if key in state:
+            return state[key]
+    return None
+
+
+def _normalize_cuda_rng_states(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise ValueError("rng_state['torch_cuda'] must be a tensor or a list/tuple of tensors.")
+    return [_as_cpu_uint8_rng_tensor(cuda_rng, key=f"torch_cuda[{index}]") for index, cuda_rng in enumerate(values)]
+
+
+def _as_cpu_uint8_rng_tensor(value: Any, *, key: str) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+    elif isinstance(value, (bytes, bytearray)):
+        tensor = torch.tensor(list(value), dtype=torch.uint8)
+    elif isinstance(value, (list, tuple)):
+        tensor = torch.as_tensor(value)
+    else:
+        raise ValueError(f"rng_state[{key!r}] must be a torch.Tensor, bytes, bytearray, list, or tuple.")
+    tensor = tensor.cpu()
+    if tensor.numel() == 0:
+        raise ValueError(f"rng_state[{key!r}] must not be empty.")
+    if tensor.dtype != torch.uint8:
+        if tensor.dtype == torch.bool or torch.is_floating_point(tensor) or torch.is_complex(tensor):
+            raise ValueError(f"rng_state[{key!r}] must use integer byte values, got dtype {tensor.dtype}.")
+        min_value = int(tensor.min().item())
+        max_value = int(tensor.max().item())
+        if min_value < 0 or max_value > 255:
+            raise ValueError(f"rng_state[{key!r}] contains values outside the uint8 range.")
+        tensor = tensor.to(dtype=torch.uint8)
+    if tensor.dim() != 1:
+        raise ValueError(f"rng_state[{key!r}] must be a 1D RNG state tensor.")
+    return tensor.contiguous().clone()

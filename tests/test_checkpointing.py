@@ -162,6 +162,100 @@ def test_load_training_checkpoint_restores_torch_cpu_rng(tmp_path) -> None:
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available.")
+def test_load_training_checkpoint_restores_torch_cuda_rng(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    torch.cuda.manual_seed_all(12345)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    expected = [
+        torch.rand(5, device=torch.device("cuda", device_index)).cpu()
+        for device_index in range(torch.cuda.device_count())
+    ]
+
+    torch.cuda.manual_seed_all(99999)
+    load_training_checkpoint(path, student, load_rng_state=True)
+    actual = [
+        torch.rand(5, device=torch.device("cuda", device_index)).cpu()
+        for device_index in range(torch.cuda.device_count())
+    ]
+
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
+def test_save_training_checkpoint_uses_canonical_rng_schema_and_dtype(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+
+    payload = load_checkpoint(path)
+    rng_state = payload["rng_state"]
+
+    assert set(rng_state) == {"torch_cpu", "torch_cuda", "python_random", "numpy_random"}
+    assert isinstance(rng_state["torch_cpu"], torch.Tensor)
+    assert rng_state["torch_cpu"].device.type == "cpu"
+    assert rng_state["torch_cpu"].dtype == torch.uint8
+    if rng_state["torch_cuda"] is not None:
+        assert all(isinstance(item, torch.Tensor) for item in rng_state["torch_cuda"])
+        assert all(item.device.type == "cpu" for item in rng_state["torch_cuda"])
+        assert all(item.dtype == torch.uint8 for item in rng_state["torch_cuda"])
+
+
+def test_load_training_checkpoint_restores_legacy_list_torch_rng_state(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    torch.manual_seed(2468)
+    path = save_training_checkpoint(
+        tmp_path,
+        student,
+        optimizer,
+        step=0,
+        optimizer_step=0,
+        config=None,
+        metadata=None,
+        rng_state=False,
+    )
+    legacy_rng_state = torch.get_rng_state().tolist()
+    payload = load_checkpoint(path)
+    payload["rng_state"] = {"torch_rng_state": legacy_rng_state}
+    save_checkpoint(path, payload)
+    expected = torch.rand(5)
+
+    torch.manual_seed(1357)
+    load_training_checkpoint(path, student, load_rng_state=True)
+    actual = torch.rand(5)
+
+    assert torch.equal(actual, expected)
+
+
+def test_load_training_checkpoint_restores_legacy_torch_cpu_list_rng_state(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    torch.manual_seed(8642)
+    path = save_training_checkpoint(
+        tmp_path,
+        student,
+        optimizer,
+        step=0,
+        optimizer_step=0,
+        config=None,
+        metadata=None,
+        rng_state=False,
+    )
+    legacy_rng_state = torch.get_rng_state().tolist()
+    payload = load_checkpoint(path)
+    payload["rng_state"] = {"torch_cpu": legacy_rng_state}
+    save_checkpoint(path, payload)
+    expected = torch.rand(5)
+
+    torch.manual_seed(9753)
+    load_training_checkpoint(path, student, load_rng_state=True)
+    actual = torch.rand(5)
+
+    assert torch.equal(actual, expected)
+
+
 def test_load_training_checkpoint_requires_rng_state_when_requested(tmp_path) -> None:
     student = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
@@ -176,7 +270,80 @@ def test_load_training_checkpoint_requires_rng_state_when_requested(tmp_path) ->
         rng_state=False,
     )
 
-    with pytest.raises(KeyError, match="rng_state"):
+    with pytest.raises(ValueError, match="rng_state"):
         load_training_checkpoint(path, student, load_rng_state=True)
 
     load_training_checkpoint(path, student, load_rng_state=False)
+
+
+def test_load_training_checkpoint_requires_torch_rng_state_when_requested(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"] = {"python_random": payload["rng_state"]["python_random"]}
+    save_checkpoint(path, payload)
+
+    with pytest.raises(ValueError, match="torch_cpu"):
+        load_training_checkpoint(path, student, load_rng_state=True)
+
+
+def test_load_training_checkpoint_rejects_non_dict_rng_state(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"] = "not-a-dict"
+    save_checkpoint(path, payload)
+
+    with pytest.raises(ValueError, match="rng_state must be a dict"):
+        load_training_checkpoint(path, student, load_rng_state=True)
+
+
+def test_load_training_checkpoint_rejects_float_cpu_rng_state(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"]["torch_cpu"] = torch.zeros_like(torch.get_rng_state(), dtype=torch.float32)
+    save_checkpoint(path, payload)
+
+    with pytest.raises(ValueError, match="integer byte values"):
+        load_training_checkpoint(path, student, load_rng_state=True)
+
+
+def test_load_training_checkpoint_rejects_2d_cpu_rng_state(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"]["torch_cpu"] = torch.zeros(2, 2, dtype=torch.uint8)
+    save_checkpoint(path, payload)
+
+    with pytest.raises(ValueError, match="1D RNG state"):
+        load_training_checkpoint(path, student, load_rng_state=True)
+
+
+def test_load_training_checkpoint_rejects_invalid_cuda_rng_container(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"]["torch_cuda"] = "not-cuda-rng"
+    save_checkpoint(path, payload)
+
+    with pytest.raises(ValueError, match="torch_cuda"):
+        load_training_checkpoint(path, student, load_rng_state=True)
+
+
+def test_load_training_checkpoint_skips_incomplete_rng_state_when_disabled(tmp_path) -> None:
+    student = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    path = save_training_checkpoint(tmp_path, student, optimizer, step=0, optimizer_step=0, config=None, metadata=None)
+    payload = load_checkpoint(path)
+    payload["rng_state"] = {"python_random": payload["rng_state"]["python_random"]}
+    save_checkpoint(path, payload)
+
+    state = load_training_checkpoint(path, student, load_rng_state=False)
+
+    assert state.step == 0

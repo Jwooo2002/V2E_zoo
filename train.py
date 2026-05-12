@@ -1153,7 +1153,31 @@ def _validate_resume_config_snapshot(
     if saved is None:
         raise ValueError("Checkpoint config snapshot is missing; cannot strict-resume.")
     if saved != current:
-        raise ValueError("Checkpoint config snapshot is incompatible with the current run.")
+        mismatches = _resume_config_mismatches(saved, current)
+        details = "; ".join(mismatches[:20])
+        suffix = f": {details}" if details else "."
+        raise ValueError("Checkpoint config snapshot is incompatible with the current run" + suffix)
+
+
+def _resume_config_mismatches(
+    checkpoint_config: dict[str, Any],
+    current_config: dict[str, Any],
+    *,
+    prefix: str = "",
+) -> list[str]:
+    sentinel = object()
+    mismatches: list[str] = []
+    for key in sorted(set(checkpoint_config) | set(current_config)):
+        path = f"{prefix}.{key}" if prefix else str(key)
+        checkpoint_value = checkpoint_config.get(key, sentinel)
+        current_value = current_config.get(key, sentinel)
+        if isinstance(checkpoint_value, dict) and isinstance(current_value, dict):
+            mismatches.extend(_resume_config_mismatches(checkpoint_value, current_value, prefix=path))
+        elif checkpoint_value != current_value:
+            checkpoint_display = "<missing>" if checkpoint_value is sentinel else repr(checkpoint_value)
+            current_display = "<missing>" if current_value is sentinel else repr(current_value)
+            mismatches.append(f"{path}: checkpoint={checkpoint_display}, current={current_display}")
+    return mismatches
 
 
 def _load_resume_state_if_needed(

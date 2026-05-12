@@ -12,7 +12,8 @@ dependency diagnostics, Stage 6C real-Mamba forward smoke support, Stage
 6D/6E student-side state and approximate off-trajectory scaffolding, and
 Stage 6F opt-in HF-teacher/RealMambaStudent smoke training, Stage 7A
 local tokenizer/text data smoke support, Stage 7B tokenizer/vocab
-alignment hardening, and Stage 7C checkpoint/resume hardening:
+alignment hardening, Stage 7C checkpoint/resume hardening, and Stage 7D
+small-experiment runner support:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -48,6 +49,10 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
 - `scripts/check_mamba_forward.py`: opt-in Stage 6C-6E real-Mamba forward
   smoke check with tiny config-driven dimensions, state/off-state reporting,
   and no downloads.
+- `scripts/run_small_experiment.py`: small experiment runner that maps flat
+  YAML configs to the existing `train.py` CLI, supports `--dry-run` and
+  repeated `--override key=value`, prints the subprocess command, and rejects
+  unknown keys.
 - `models/student_mamba.py`: lightweight mock student that produces
   on-trajectory logits, off-trajectory logits, and detached fake logits, plus
   an optional `RealMambaStudent` adapter with lazy `mamba_ssm` import, public
@@ -75,6 +80,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   not a required dependency.
 - `configs/model_config.yaml`: mock teacher/student defaults plus an opt-in
   HuggingFace teacher example block.
+- `configs/experiments/smoke_mock.yaml`: mock-only small experiment config.
+- `configs/experiments/smoke_real_mamba.yaml`: opt-in local-files-only
+  HF-teacher/real-Mamba smoke command template.
 - `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
@@ -86,6 +94,18 @@ Run two optimizer steps without real Llama or Mamba imports:
 ```bash
 python train.py --config configs/train_config.yaml --mock --max_steps 2
 ```
+
+Run or inspect the Stage 7D flat-YAML smoke runner:
+
+```bash
+python scripts/run_small_experiment.py --experiment configs/experiments/smoke_mock.yaml --dry-run
+python scripts/run_small_experiment.py --experiment configs/experiments/smoke_mock.yaml --override max_steps=1
+```
+
+`configs/experiments/smoke_real_mamba.yaml` is an opt-in local smoke template.
+It sets `local_files_only: true` and uses a placeholder `local-hf-teacher`
+path, so point `teacher_model_name_or_path` at a local HF causal-LM before
+running it.
 
 `MockTextDataset` creates labels by shifting tokens left for next-token
 prediction and sets `labels[-1] = -100`. The training loop applies one shared
@@ -429,6 +449,40 @@ python train.py \
   --max_steps 4 \
   --resume-from /tmp/csdm_ckpt/checkpoint_step_2_opt_2.pt
 ```
+
+## Stage 7D Small Experiment Runner
+
+Stage 7D adds reproducible, single-process experiment entrypoints. The runner
+does not implement new training logic; it prints and runs `train.py` with
+existing CLI flags, so CE/KD/CSDM math and teacher behavior remain unchanged.
+
+Mock smoke run, no external downloads:
+
+```bash
+python scripts/run_small_experiment.py \
+  --experiment configs/experiments/smoke_mock.yaml
+```
+
+Dry run and overrides:
+
+```bash
+python scripts/run_small_experiment.py \
+  --experiment configs/experiments/smoke_mock.yaml \
+  --dry-run \
+  --override max_steps=1 \
+  --override checkpoint_output_dir=/tmp/csdm_runner_ckpt \
+  --override teacher_cache_dir=/tmp/csdm_runner_cache
+```
+
+Manual real-Mamba smoke, requiring local/cached HF artifacts and `mamba_ssm`:
+
+```bash
+python scripts/run_small_experiment.py \
+  --experiment configs/experiments/smoke_real_mamba.yaml
+```
+
+This is still small-scale, single-process tooling. Distributed or 2x4090
+training orchestration is intentionally left for a later stage.
 
 Mock teacher/student text smoke:
 
