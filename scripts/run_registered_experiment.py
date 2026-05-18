@@ -33,6 +33,7 @@ from utils.manifest import (  # noqa: E402
     write_manifest,
 )
 from utils.checkpointing import latest_checkpoint  # noqa: E402
+from utils.artifact_health import check_artifacts  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,30 +50,105 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--with-needle", action="store_true")
     parser.add_argument("--with-report", action="store_true")
     parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Subprocess timeout for train/eval/report commands. Defaults to 300 seconds for smoke runs.",
+    )
+    parser.add_argument(
+        "--no-timeout",
+        action="store_true",
+        help="Disable subprocess timeouts for longer real training runs.",
+    )
+    parser.add_argument(
         "--eval-trained-checkpoint",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Pass the latest run checkpoint to evaluation commands when one exists.",
     )
+    parser.add_argument(
+        "--artifact-health-check",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="After training, scan run cache/checkpoint .pt files before eval/report steps.",
+    )
+    parser.add_argument(
+        "--artifact-health-max-files",
+        type=int,
+        default=None,
+        help="Legacy quick-triage cap across all artifacts during --artifact-health-check.",
+    )
+    parser.add_argument(
+        "--artifact-health-cache-sample-size",
+        type=int,
+        default=64,
+        help="Number of cache files to sample during --artifact-health-check; checkpoints are always scanned.",
+    )
+    parser.add_argument(
+        "--artifact-health-full-cache",
+        action="store_true",
+        help="Scan every cache file during --artifact-health-check instead of sampling.",
+    )
     return parser.parse_args(argv)
 
 
-def _run_command(command: list[str], *, stdout_path: Path, stderr_path: Path) -> int:
+def _effective_timeout(args: argparse.Namespace) -> float | None:
+    if args.no_timeout:
+        return None
+    if args.timeout_seconds <= 0:
+        raise ValueError("--timeout-seconds must be positive, or use --no-timeout.")
+    return float(args.timeout_seconds)
+
+
+def _run_command(
+    command: list[str],
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_seconds: float | None,
+) -> int:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
         "w", encoding="utf-8"
     ) as stderr_handle:
-        result = subprocess.run(
-            command,
-            cwd=ROOT,
-            text=True,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            check=False,
-            timeout=300,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeout_label = "disabled" if timeout_seconds is None else f"{timeout_seconds:g} seconds"
+            stderr_handle.write(f"Command timed out after {timeout_label}.\n")
+            if exc.stderr:
+                stderr_text = (
+                    exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr)
+                )
+                stderr_handle.write(stderr_text)
+            if exc.stdout:
+                stdout_text = (
+                    exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout)
+                )
+                stdout_handle.write(stdout_text)
+            return 124
     return int(result.returncode)
+
+
+def _first_nonempty_line(path: Path, *, max_chars: int = 500) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            return stripped[:max_chars]
+    return None
 
 
 def _experiment_config(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
@@ -234,16 +310,31 @@ def _manifest(
     status: str,
     returncodes: dict[str, int | None],
     eval_checkpoint: Path | None = None,
+    failure_stage: str | None = None,
+    failure_reason: str | None = None,
+    failure_log_path: Path | None = None,
 ) -> RunManifest:
     git_info = get_git_info(ROOT)
+    timeout_seconds = _effective_timeout(args)
     metadata: dict[str, Any] = {
         "experiment": str(args.experiment),
         "overrides": list(args.override),
         "status": status,
         "returncodes": returncodes,
         "dry_run": bool(args.dry_run),
+        "timeout_seconds": timeout_seconds,
+        "timeout_disabled": timeout_seconds is None,
         "eval_trained_checkpoint": bool(args.eval_trained_checkpoint),
         "eval_checkpoint": None if eval_checkpoint is None else str(eval_checkpoint),
+        "artifact_health_check": bool(args.artifact_health_check),
+        "artifact_health_max_files": args.artifact_health_max_files,
+        "artifact_health_cache_sample_size": (
+            None if args.artifact_health_full_cache else args.artifact_health_cache_sample_size
+        ),
+        "artifact_health_full_cache": bool(args.artifact_health_full_cache),
+        "failure_stage": failure_stage,
+        "failure_reason": failure_reason,
+        "failure_log_path": None if failure_log_path is None else str(failure_log_path),
     }
     if git_info.is_dirty and not args.allow_dirty_git:
         metadata["warning"] = "git working tree is dirty"
@@ -261,7 +352,7 @@ def _manifest(
     )
 
 
-def run_registered_experiment(args: argparse.Namespace) -> Path:
+def run_registered_experiment(args: argparse.Namespace) -> tuple[Path, str]:
     run_id = args.run_id or generate_run_id(
         prefix="run",
         extra={"experiment": str(args.experiment), "overrides": sorted(args.override)},
@@ -274,20 +365,62 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
     commands = [train_command]
     returncodes: dict[str, int | None] = {"train": None}
     status = "planned" if args.dry_run else "success"
+    timeout_seconds = _effective_timeout(args)
+    failure_stage: str | None = None
+    failure_reason: str | None = None
+    failure_log_path: Path | None = None
 
     if args.dry_run:
         (run_dir / "logs" / "planned_command.txt").write_text(shell_join(train_command) + "\n", encoding="utf-8")
         print(shell_join(train_command), flush=True)
     else:
-        validate_execution_paths(experiment_config)
-        train_code = _run_command(
-            train_command,
-            stdout_path=run_dir / "logs" / "train.stdout",
-            stderr_path=run_dir / "logs" / "train.stderr",
-        )
-        returncodes["train"] = train_code
-        if train_code != 0:
+        try:
+            validate_execution_paths(experiment_config)
+        except (OSError, ValueError) as exc:
             status = "failed"
+            returncodes["preflight"] = 1
+            failure_stage = "preflight"
+            failure_reason = str(exc)
+            failure_log_path = run_dir / "logs" / "preflight.stderr"
+            failure_log_path.parent.mkdir(parents=True, exist_ok=True)
+            failure_log_path.write_text(f"{failure_reason}\n", encoding="utf-8")
+
+        if status == "success":
+            train_code = _run_command(
+                train_command,
+                stdout_path=run_dir / "logs" / "train.stdout",
+                stderr_path=run_dir / "logs" / "train.stderr",
+                timeout_seconds=timeout_seconds,
+            )
+            returncodes["train"] = train_code
+            if train_code != 0:
+                status = "failed"
+                failure_stage = "train"
+                failure_log_path = run_dir / "logs" / "train.stderr"
+                failure_reason = _first_nonempty_line(failure_log_path) or f"train exited with code {train_code}"
+
+    if not args.dry_run and args.artifact_health_check:
+        health_report = check_artifacts(
+            run_dir,
+            cache_sample_size=None if args.artifact_health_full_cache else args.artifact_health_cache_sample_size,
+            max_files=args.artifact_health_max_files,
+        )
+        health_path = run_dir / "artifacts" / "artifact_health.json"
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        health_path.write_text(json.dumps(health_report.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        health_code = 0 if health_report.ok else 1
+        returncodes["artifact_health"] = health_code
+        if health_code != 0:
+            status = "failed"
+            if failure_stage is None:
+                failure_stage = "artifact_health"
+                failure_log_path = health_path
+                failure_reason = (
+                    "artifact health failed: "
+                    f"corrupt_count={health_report.corrupt_count}, "
+                    f"missing_count={health_report.missing_count}, "
+                    f"checked_count={health_report.checked_count}"
+                )
 
     eval_checkpoint = (
         None if args.dry_run or status != "success" else _latest_eval_checkpoint(args, run_dir, experiment_config)
@@ -301,10 +434,14 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
                 eval_command,
                 stdout_path=run_dir / "evals" / "eval.json",
                 stderr_path=run_dir / "logs" / "eval.stderr",
+                timeout_seconds=timeout_seconds,
             )
             returncodes["eval"] = eval_code
             if eval_code != 0:
                 status = "failed"
+                failure_stage = "eval"
+                failure_log_path = run_dir / "logs" / "eval.stderr"
+                failure_reason = _first_nonempty_line(failure_log_path) or f"eval exited with code {eval_code}"
         else:
             returncodes["eval"] = None
 
@@ -316,10 +453,14 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
                 command,
                 stdout_path=run_dir / "logs" / "perturbation.stdout",
                 stderr_path=run_dir / "logs" / "perturbation.stderr",
+                timeout_seconds=timeout_seconds,
             )
             returncodes["perturbation"] = code
             if code != 0:
                 status = "failed"
+                failure_stage = "perturbation"
+                failure_log_path = run_dir / "logs" / "perturbation.stderr"
+                failure_reason = _first_nonempty_line(failure_log_path) or f"perturbation exited with code {code}"
         else:
             returncodes["perturbation"] = None
 
@@ -330,10 +471,14 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
             command,
             stdout_path=run_dir / "logs" / "needle.stdout",
             stderr_path=run_dir / "logs" / "needle.stderr",
+            timeout_seconds=timeout_seconds,
         )
         returncodes["needle"] = code
         if code != 0:
             status = "failed"
+            failure_stage = "needle"
+            failure_log_path = run_dir / "logs" / "needle.stderr"
+            failure_reason = _first_nonempty_line(failure_log_path) or f"needle exited with code {code}"
 
     if not args.dry_run and status == "success" and args.with_report:
         command = _report_command(run_dir)
@@ -342,10 +487,14 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
             command,
             stdout_path=run_dir / "logs" / "report.stdout",
             stderr_path=run_dir / "logs" / "report.stderr",
+            timeout_seconds=timeout_seconds,
         )
         returncodes["report"] = code
         if code != 0:
             status = "failed"
+            failure_stage = "report"
+            failure_log_path = run_dir / "logs" / "report.stderr"
+            failure_reason = _first_nonempty_line(failure_log_path) or f"report exited with code {code}"
 
     manifest = _manifest(
         run_id=run_id,
@@ -355,19 +504,22 @@ def run_registered_experiment(args: argparse.Namespace) -> Path:
         status=status,
         returncodes=returncodes,
         eval_checkpoint=eval_checkpoint,
+        failure_stage=failure_stage,
+        failure_reason=failure_reason,
+        failure_log_path=failure_log_path,
     )
     write_manifest(manifest, run_dir / "manifest.json")
     print(run_dir, flush=True)
-    return run_dir
+    return run_dir, status
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        run_registered_experiment(args)
+        _run_dir, status = run_registered_experiment(args)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise SystemExit(str(exc)) from exc
-    return 0
+    return 0 if status in {"success", "planned"} else 1
 
 
 if __name__ == "__main__":

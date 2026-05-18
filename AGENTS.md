@@ -165,3 +165,4 @@ A task is done only when:
 - README documents how to run the implemented part
 - subagent review findings have been addressed or explicitly noted
 EOF
+EOF

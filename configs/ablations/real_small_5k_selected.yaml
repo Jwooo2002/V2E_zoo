@@ -1,0 +1,52 @@
+experiment_name: real_small_5k_selected
+
+base:
+  config: configs/train_config.yaml
+  mock: false
+  teacher_type: hf
+  student_type: mamba
+  teacher_model_name_or_path: sshleifer/tiny-gpt2
+  tokenizer_name_or_path: sshleifer/tiny-gpt2
+  local_files_only: true
+  dataset_type: text
+  data_path: ${CSDM_DATA_PATH}
+  seq_len: 128
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  max_steps: 5000
+  student_hidden_size: 128
+  student_num_layers: 4
+  mixed_precision: bf16
+  top_k: 128
+  teacher_cache_enabled: true
+  save_every_steps: 500
+  save_at_end: true
+
+variants:
+  - name: kd
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.0
+    topk_enabled: false
+    teacher_cache_dir: /tmp/csdm_real_small_5k/cache/kd
+    checkpoint_output_dir: /tmp/csdm_real_small_5k/checkpoints/kd
+
+  - name: csdm_w01
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.1
+    topk_enabled: false
+    teacher_cache_dir: /tmp/csdm_real_small_5k/cache/csdm_w01
+    checkpoint_output_dir: /tmp/csdm_real_small_5k/checkpoints/csdm_w01
+
+  - name: csdm_topk_w003
+    requires_mamba: true
+    ce_weight: 0.2
+    kd_weight: 1.0
+    csdm_weight: 0.03
+    topk_enabled: true
+    top_k: 128
+    teacher_cache_dir: /tmp/csdm_real_small_5k/cache/csdm_topk_w003
+    checkpoint_output_dir: /tmp/csdm_real_small_5k/checkpoints/csdm_topk_w003

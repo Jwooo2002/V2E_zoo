@@ -1,4 +1,12 @@
+from .artifact_health import (
+    ArtifactFileReport,
+    ArtifactHealthReport,
+    check_artifacts,
+    check_torch_artifact,
+    discover_artifact_files,
+)
 from .checkpointing import (
+    CheckpointLoadError,
     StudentCheckpointState,
     TrainingCheckpointState,
     latest_checkpoint,
@@ -9,9 +17,10 @@ from .checkpointing import (
     save_checkpoint,
     save_training_checkpoint,
 )
-from .logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
+from .logit_cache import LogitCacheConfig, LogitCacheEntry, LogitCacheLoadError, TeacherLogitCache
 from .logger import ConsoleLogger
 from .mamba_env import MambaDependencyReport, check_mamba_dependencies, format_mamba_dependency_report
+from .storage import StoragePathReport, nearest_existing_path, storage_path_report, validate_storage_paths
 from .distributed import (
     DistributedContext,
     RankZeroLogger,
@@ -34,18 +43,26 @@ from .distributed import (
 
 __all__ = [
     "ConsoleLogger",
+    "ArtifactFileReport",
+    "ArtifactHealthReport",
+    "CheckpointLoadError",
     "LogitCacheConfig",
     "LogitCacheEntry",
+    "LogitCacheLoadError",
     "MambaDependencyReport",
     "DistributedContext",
     "RankZeroLogger",
     "StudentCheckpointState",
+    "StoragePathReport",
     "TeacherLogitCache",
     "TrainingCheckpointState",
     "average_float_dict",
     "barrier",
+    "check_artifacts",
     "check_mamba_dependencies",
+    "check_torch_artifact",
     "cleanup_distributed",
+    "discover_artifact_files",
     "effective_batch_size",
     "format_mamba_dependency_report",
     "get_device_for_rank",
@@ -60,10 +77,13 @@ __all__ = [
     "load_student_checkpoint",
     "load_student_from_checkpoint",
     "load_training_checkpoint",
+    "nearest_existing_path",
     "rank_local_dir",
     "rank_zero_json_log",
     "rank_zero_print",
     "save_checkpoint",
     "save_training_checkpoint",
+    "storage_path_report",
     "unwrap_model",
+    "validate_storage_paths",
 ]

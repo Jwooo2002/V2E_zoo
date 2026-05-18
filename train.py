@@ -46,6 +46,7 @@ from utils.distributed import (
 )
 from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
+from utils.storage import validate_storage_paths
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,11 @@ class DistributedConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    min_free_gb: float = 0.0
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     seed: int = 42
     teacher_type: str = "mock"
@@ -147,6 +153,7 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     topk: TopKConfig = field(default_factory=TopKConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     teacher_cache: LogitCacheConfig = field(default_factory=LogitCacheConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -168,6 +175,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-model-name-or-path", default=None)
     parser.add_argument("--hf-torch-dtype", choices=("float32", "float16", "bfloat16"), default=None)
     parser.add_argument("--hf-device-map", default=None, help="HF teacher device_map; use 'none' for rank-local .to(device).")
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow or disallow remote code for HF teacher/tokenizer loading.",
+    )
+    parser.add_argument(
+        "--use-safetensors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require safetensors for HF teacher loading when available.",
+    )
     parser.add_argument("--dataset-type", choices=("mock", "text", "jsonl"), default=None)
     parser.add_argument("--data-path", default=None)
     parser.add_argument("--tokenizer-name-or-path", default=None)
@@ -262,6 +281,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--distributed-backend", choices=("nccl", "gloo"), default=None)
     parser.add_argument("--ddp-find-unused-parameters", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--storage-min-free-gb",
+        type=float,
+        default=None,
+        help="Optional preflight free-space threshold for checkpoint/cache destinations. Disabled at 0.",
+    )
     return parser.parse_args()
 
 
@@ -369,6 +394,10 @@ def _parse_distributed_config(raw: dict[str, Any]) -> DistributedConfig:
     )
 
 
+def _parse_storage_config(raw: dict[str, Any]) -> StorageConfig:
+    return StorageConfig(min_free_gb=float(_nested_get(raw, "min_free_gb", StorageConfig.min_free_gb)))
+
+
 def _parse_mamba_student_config(raw: dict[str, Any]) -> MambaStudentConfig:
     return MambaStudentConfig(
         model_name_or_path=_optional_str(raw.get("model_name_or_path")),
@@ -420,6 +449,7 @@ def load_train_config(path: Path) -> TrainConfig:
     teacher_cache_raw = raw.get("teacher_cache", {}) or {}
     checkpoint_raw = raw.get("checkpoint", {}) or {}
     distributed_raw = raw.get("distributed", {}) or {}
+    storage_raw = raw.get("storage", {}) or {}
     loss = LossConfig(
         ce_weight=float(_nested_get(loss_raw, "ce_weight", LossConfig.ce_weight)),
         kd_weight=float(_nested_get(loss_raw, "kd_weight", LossConfig.kd_weight)),
@@ -481,6 +511,7 @@ def load_train_config(path: Path) -> TrainConfig:
         max_grad_norm=float(_nested_get(raw, "max_grad_norm", TrainConfig.max_grad_norm)),
         topk=topk,
         distributed=distributed,
+        storage=_parse_storage_config(storage_raw),
         teacher_cache=_parse_logit_cache_config(teacher_cache_raw),
         checkpoint=checkpoint,
         loss=loss,
@@ -607,6 +638,14 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
         config = replace(config, hf_teacher=replace(config.hf_teacher, torch_dtype=args.hf_torch_dtype))
     if getattr(args, "hf_device_map", None) is not None:
         config = replace(config, hf_teacher=replace(config.hf_teacher, device_map=_optional_device_map(args.hf_device_map)))
+    if getattr(args, "trust_remote_code", None) is not None:
+        config = replace(
+            config,
+            hf_teacher=replace(config.hf_teacher, trust_remote_code=args.trust_remote_code),
+            data=replace(config.data, trust_remote_code=args.trust_remote_code),
+        )
+    if getattr(args, "use_safetensors", None) is not None:
+        config = replace(config, hf_teacher=replace(config.hf_teacher, use_safetensors=args.use_safetensors))
     if not args.mock and getattr(args, "dataset_type", None) is not None:
         config = replace(config, data=replace(config.data, dataset_type=_normalize_dataset_type(args.dataset_type)))
     if not args.mock and getattr(args, "data_path", None) is not None:
@@ -734,6 +773,8 @@ def derive_runtime_config(args: argparse.Namespace) -> TrainConfig:
                 find_unused_parameters=args.ddp_find_unused_parameters,
             ),
         )
+    if getattr(args, "storage_min_free_gb", None) is not None:
+        config = replace(config, storage=replace(config.storage, min_free_gb=args.storage_min_free_gb))
     if config.student_type == "mamba" and config.teacher_type == "mock":
         config = replace(config, mock=replace(config.mock, vocab_size=config.mamba_student.vocab_size))
     if config.teacher_type == "hf" and config.data.dataset_type != "mock" and config.data.tokenizer_name_or_path is None:
@@ -1236,6 +1277,7 @@ def _normalized_resume_config(config: dict[str, Any] | None) -> dict[str, Any] |
         return None
     normalized = dict(config)
     normalized.pop("checkpoint", None)
+    normalized.pop("storage", None)
     teacher_cache = normalized.get("teacher_cache")
     if isinstance(teacher_cache, dict):
         teacher_cache = dict(teacher_cache)
@@ -1356,6 +1398,24 @@ def _advance_batches(batches: Iterator[dict[str, Tensor]], count: int) -> None:
         next(batches)
 
 
+def _storage_preflight_paths(config: TrainConfig) -> list[str]:
+    paths: list[str] = []
+    if config.teacher_cache.enabled:
+        paths.append(config.teacher_cache.cache_dir)
+    if config.checkpoint.save_every_steps > 0 or config.checkpoint.save_at_end:
+        paths.append(config.checkpoint.output_dir)
+    return list(dict.fromkeys(paths))
+
+
+def _run_storage_preflight(config: TrainConfig) -> None:
+    if config.storage.min_free_gb <= 0:
+        return
+    paths = _storage_preflight_paths(config)
+    if not paths:
+        return
+    validate_storage_paths(paths, min_free_gb=config.storage.min_free_gb)
+
+
 def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | None = None) -> None:
     if max_steps <= 0:
         raise ValueError("max_steps must be positive.")
@@ -1363,6 +1423,8 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         raise ValueError("gradient_accumulation_steps must be positive.")
     if config.checkpoint.save_every_steps < 0:
         raise ValueError("checkpoint.save_every_steps must be non-negative.")
+    if config.storage.min_free_gb < 0:
+        raise ValueError("storage.min_free_gb must be non-negative.")
     if config.teacher_cache.enabled and config.teacher_cache.use_top_k:
         raise NotImplementedError(
             "Top-k-only teacher logit cache entries cannot be used by train.py yet. "
@@ -1392,6 +1454,7 @@ def run_training(config: TrainConfig, max_steps: int, logger: ConsoleLogger | No
         set_seed(config.seed)
         device = _training_device(config, distributed)
         config = _apply_distributed_teacher_cache_policy(config, distributed)
+        _run_storage_preflight(config)
         _run_training_inner(config, max_steps=max_steps, logger=logger, distributed=distributed, device=device)
     finally:
         cleanup_distributed(distributed)

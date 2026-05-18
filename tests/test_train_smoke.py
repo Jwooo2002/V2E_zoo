@@ -29,6 +29,7 @@ compute_losses = train_module.compute_losses
 load_train_config = train_module.load_train_config
 run_training = train_module.run_training
 LogitCacheConfig = train_module.LogitCacheConfig
+StorageConfig = train_module.StorageConfig
 
 
 def test_mock_dataset_next_token_shift_and_ignore_index() -> None:
@@ -471,6 +472,28 @@ def test_train_topk_only_teacher_cache_path_raises_not_implemented(tmp_path: Pat
 
     with pytest.raises(NotImplementedError, match="Top-k-only teacher logit cache entries"):
         run_training(config, max_steps=1)
+
+
+def test_storage_preflight_paths_track_enabled_artifact_writes(tmp_path: Path) -> None:
+    config = load_train_config(ROOT / "configs" / "train_config.yaml")
+    config = replace(
+        config,
+        storage=StorageConfig(min_free_gb=0.0),
+        teacher_cache=LogitCacheConfig(enabled=True, cache_dir=str(tmp_path / "cache")),
+        checkpoint=replace(
+            config.checkpoint,
+            output_dir=str(tmp_path / "ckpt"),
+            save_at_end=True,
+        ),
+    )
+
+    assert train_module._storage_preflight_paths(config) == [str(tmp_path / "cache"), str(tmp_path / "ckpt")]
+
+
+def test_storage_preflight_disabled_by_default() -> None:
+    config = load_train_config(ROOT / "configs" / "train_config.yaml")
+
+    assert config.storage.min_free_gb == 0.0
 
 
 def test_mock_training_does_not_instantiate_real_teacher_or_student() -> None:

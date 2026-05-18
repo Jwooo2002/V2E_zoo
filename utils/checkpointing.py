@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import random
 import re
 from typing import Any
+from uuid import uuid4
 
 import torch
 from torch import nn
@@ -40,14 +42,22 @@ class StudentCheckpointState:
     rng_state: dict[str, Any] | None = None
 
 
+class CheckpointLoadError(RuntimeError):
+    """Raised when a checkpoint exists but cannot be deserialized safely."""
+
+
 def save_checkpoint(path: str | Path, state: dict[str, Any]) -> None:
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, checkpoint_path)
+    _atomic_torch_save(state, checkpoint_path)
 
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
-    state = torch.load(Path(path), map_location=map_location, weights_only=False)
+    checkpoint_path = Path(path)
+    try:
+        state = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    except Exception as exc:
+        raise CheckpointLoadError(f"Checkpoint {checkpoint_path} could not be loaded.") from exc
     if not isinstance(state, dict):
         raise TypeError(f"checkpoint must contain a dict, got {type(state).__name__}.")
     return state
@@ -126,7 +136,7 @@ def save_training_checkpoint(
     }
     if rng_state:
         payload["rng_state"] = _capture_rng_state()
-    torch.save(payload, path)
+    _atomic_torch_save(payload, path)
     return path
 
 
@@ -238,6 +248,22 @@ def _checkpoint_sort_key(path: Path) -> tuple[int, int, float]:
     if match:
         return int(match.group(1)), int(match.group(2)), path.stat().st_mtime
     return -1, -1, path.stat().st_mtime
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    """Write a torch payload without exposing partially written final files."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _capture_rng_state() -> dict[str, Any]:

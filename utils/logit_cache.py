@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import torch
 
@@ -64,6 +66,10 @@ class LogitCacheEntry:
 
 
 ComputeFn = Callable[..., torch.Tensor | LogitCacheEntry]
+
+
+class LogitCacheLoadError(RuntimeError):
+    """Raised when a cache file exists but cannot be deserialized safely."""
 
 
 class TeacherLogitCache:
@@ -147,16 +153,23 @@ class TeacherLogitCache:
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         path = self._path_for_key(key)
-        torch.save(entry, path)
+        self._atomic_save(entry, path)
         return path
 
     def load(self, key: str, map_location: str | torch.device | None = None) -> LogitCacheEntry:
         location = map_location if map_location is not None else self.config.torch_device
         path = self._path_for_key(key)
         try:
-            raw = torch.load(path, map_location=location, weights_only=True)
-        except TypeError:
-            raw = torch.load(path, map_location=location)
+            try:
+                raw = torch.load(path, map_location=location, weights_only=True)
+            except TypeError:
+                raw = torch.load(path, map_location=location)
+        except Exception as exc:
+            raise LogitCacheLoadError(f"Teacher logit cache entry {path} could not be loaded.") from exc
+        if not isinstance(raw, dict):
+            raise LogitCacheLoadError(
+                f"Teacher logit cache entry {path} must contain a dict, got {type(raw).__name__}."
+            )
 
         entry = LogitCacheEntry(
             logits=self._detach_optional(raw.get("logits")),
@@ -176,7 +189,13 @@ class TeacherLogitCache:
     ) -> LogitCacheEntry:
         key = self.make_key(input_ids, attention_mask=attention_mask, extra=extra)
         if self.config.enabled and self.exists(key) and not self.config.overwrite:
-            return self.load(key)
+            try:
+                return self.load(key)
+            except LogitCacheLoadError:
+                # A cache entry is only a detached teacher(clean prefix) artifact.
+                # If a previous run left a partial .pt file, recompute instead
+                # of aborting long training.
+                pass
 
         with torch.no_grad():
             result = compute_fn(input_ids, attention_mask=attention_mask)
@@ -215,6 +234,19 @@ class TeacherLogitCache:
 
     def _path_for_key(self, key: str) -> Path:
         return self.cache_dir / f"{key}.{self.config.format}"
+
+    @staticmethod
+    def _atomic_save(payload: dict[str, Any], path: Path) -> None:
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     @staticmethod
     def _hash_tensor(hasher: Any, name: str, tensor: torch.Tensor) -> None:

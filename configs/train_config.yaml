@@ -11,6 +11,9 @@ distributed:
   backend:
   find_unused_parameters: false
 
+storage:
+  min_free_gb: 0.0
+
 data:
   dataset_type: mock
   path:

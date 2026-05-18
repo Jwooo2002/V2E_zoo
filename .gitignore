@@ -34,3 +34,4 @@ checkpoints/
 *.bin
 data/raw/
 data/processed/
+data/real_small_corpus.txt

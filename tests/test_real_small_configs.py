@@ -74,7 +74,7 @@ def test_real_small_variant_weights_are_correct() -> None:
 
 
 def test_real_small_ablation_matrix_contains_expected_variants() -> None:
-    matrix = load_matrix(MATRIX_PATH)
+    matrix = _load_yaml(MATRIX_PATH)
     base = matrix["base"]
     variants = {variant["name"]: variant for variant in matrix["variants"]}
 

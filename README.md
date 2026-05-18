@@ -18,8 +18,9 @@ Stage 8A ablation matrix orchestration, Stage 8B result reporting, Stage 8C
 perturbation robustness benchmarking, Stage 8D synthetic
 Needle-in-a-Haystack benchmarking, Stage 8E run registry tooling, Stage 9A
 tiny real pilot configs, Stage 9B checkpoint-backed registered evaluation,
-Stage 9C dual full-vocab/top-k perturbation reporting, and Stage 10A
-real-small training configs:
+Stage 9C dual full-vocab/top-k perturbation reporting, Stage 10A/10B
+real-small training configs, and Stage 11A 7B sanity top-k dry-run
+orchestration:
 configuration skeletons, KD/CSDM loss functions, off-trajectory student-state
 construction, mock teacher/student modules, token-weighted evaluation metrics,
 teacher-logit cache utilities, and unit tests with mock tensors.
@@ -83,6 +84,9 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   directory with logs, checkpoints, cache, eval outputs, and manifest metadata.
 - `scripts/run_tiny_pilot.py`: Stage 9A convenience runner for tiny real
   CE/KD/CSDM pilot variants through the run registry.
+- `scripts/run_7b_sanity.py`: Stage 11A convenience runner for 7B-teacher
+  top-k KD/CSDM sanity variants through the run registry, with dry-run env
+  reporting and non-dry-run env validation.
 - `scripts/launch_2x4090.sh`: Accelerate launcher for the 2x4090 real-Mamba
   smoke template.
 - `scripts/launch_mock_distributed_smoke.sh`: Accelerate launcher for the
@@ -132,6 +136,11 @@ recurrent states shaped `[B, D]` or `[B, T, D]`.
   pilot templates for CE, KD, CSDM, and CSDM top-k variants.
 - `configs/ablations/tiny_real_pilot.yaml`: Stage 9A tiny real pilot matrix
   for the same CE/KD/CSDM/top-k comparison.
+- `configs/experiments/train_7b_sanity_*_topk.yaml`: Stage 11A local-only
+  7B-teacher top-k sanity templates using `CSDM_TEACHER_PATH`,
+  `CSDM_TOKENIZER_PATH`, and `CSDM_DATA_PATH`.
+- `configs/ablations/7b_sanity_topk.yaml`: Stage 11A dry-runable KD/CSDM
+  top-k sanity matrix for the same 7B-teacher placeholders.
 - `docs/requirements-mamba.txt`: optional real-Mamba dependency notes.
 - `tests/`: mock-tensor tests for shapes, finite losses, invalid inputs, and
   gradient-flow behavior.
@@ -1002,8 +1011,74 @@ python scripts/run_registered_experiment.py \
   --base-output-dir /tmp/csdm_real_small_runs \
   --override max_steps=1000 \
   --with-perturbation \
-  --with-report
+  --with-report \
+  --no-timeout
 ```
+
+Registered smoke runs default to a 300-second subprocess timeout. Real-small
+training can legitimately run much longer because `max_steps=1000` with
+`gradient_accumulation_steps=16` means 16000 micro-steps. Use `--no-timeout`
+for manual training, or set a large explicit timeout:
+
+```bash
+python scripts/run_registered_experiment.py \
+  --experiment configs/experiments/train_real_small_csdm_topk.yaml \
+  --base-output-dir /tmp/csdm_real_small_runs \
+  --override max_steps=1000 \
+  --timeout-seconds 43200
+```
+
+For long runs, you can fail early if the checkpoint/cache filesystem is nearly
+full. The check is opt-in and defaults to disabled:
+
+```bash
+python scripts/run_registered_experiment.py \
+  --experiment configs/experiments/train_real_small_csdm_topk.yaml \
+  --base-output-dir /mnt/sda2/csdm_real_small_runs \
+  --override max_steps=1000 \
+  --override storage_min_free_gb=20 \
+  --no-timeout
+```
+
+Before resuming or archiving a long run, check cached logits and checkpoints for
+unreadable `.pt` files:
+
+```bash
+python scripts/check_artifacts.py /tmp/csdm_real_small_runs/<run_id> \
+  --cache-sample-size 64 \
+  --fail-on-corrupt
+```
+
+This is read-only. It loads local torch artifacts on CPU and reports corrupt
+cache/checkpoint files that would otherwise fail a later resume or eval.
+`--cache-sample-size` scans a deterministic cache sample while still checking
+all checkpoints; omit it for a full cache scan.
+For registered runs, add `--artifact-health-check` to run the same scan after
+training and before optional eval/report steps. Registered runs default to a
+64-file cache sample plus all checkpoints; add `--artifact-health-full-cache`
+when you need a full cache scan. If training itself fails, the registered
+runner still writes `artifacts/artifact_health.json` so the run directory
+captures whether local cache/checkpoint corruption contributed to the failure.
+The registered runner exits nonzero when the manifest status is `failed`, so
+shell launchers stop instead of treating a failed long run as successful.
+Failed manifests include `failure_stage`, `failure_reason`, and
+`failure_log_path` fields for quick triage:
+
+```bash
+python scripts/run_registered_experiment.py \
+  --experiment configs/experiments/train_real_small_csdm_topk.yaml \
+  --base-output-dir /mnt/sda2/csdm_real_small_runs \
+  --override max_steps=1000 \
+  --artifact-health-check \
+  --with-perturbation \
+  --with-report \
+  --no-timeout
+```
+
+Preflight failures, such as unresolved `${CSDM_DATA_PATH}` or missing local
+text data, are recorded the same way before model setup. The runner still
+prints the run directory and writes `manifest.json` with
+`failure_stage: preflight`, so failed real-run launches remain traceable.
 
 Ablation dry-run/execution:
 
@@ -1020,6 +1095,140 @@ python scripts/run_ablation_matrix.py \
 Suggested scaling: `1000` steps for sanity, `5000` for a small ablation, and
 `20000` for a more serious pilot once cache, checkpoints, and perturbation
 reports look sane.
+
+## Stage 10B Selected 5k Real-Small Pilots
+
+Stage 10B promotes the strongest 1k candidates into selected 5k runs. This is
+still orchestration over the existing training loop, not a change to
+CE/KD/CSDM math or teacher/Mamba behavior.
+
+Selected candidates:
+
+- `kd`: KD baseline, `csdm_weight=0.0`, full-vocab KD.
+- `csdm_w01`: full-vocab CSDM candidate, `csdm_weight=0.1`.
+- `csdm_topk_w003`: top-k CSDM candidate, `csdm_weight=0.03`, `top_k=128`.
+
+All selected configs use `max_steps=5000`, `gradient_accumulation_steps=16`,
+`seq_len=128`, `batch_size=1`, `student_hidden_size=128`,
+`student_num_layers=4`, teacher cache, and checkpoint saves every 500 optimizer
+steps. Set the corpus path before real execution:
+
+```bash
+export CSDM_DATA_PATH=/path/to/real_corpus.txt
+```
+
+Dry-run all selected variants:
+
+```bash
+python scripts/run_real_small_5k.py --variant all --dry-run
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/real_small_5k_selected.yaml \
+  --dry-run
+```
+
+For manual GPU isolation, launch variants in separate terminals:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/run_real_small_5k.py \
+  --variant kd \
+  --base-output-dir /tmp/csdm_real_small_5k_kd \
+  --storage-min-free-gb 20 \
+  --artifact-health-check \
+  --no-timeout
+
+CUDA_VISIBLE_DEVICES=1 python scripts/run_real_small_5k.py \
+  --variant csdm_topk_w003 \
+  --base-output-dir /tmp/csdm_real_small_5k_topk \
+  --storage-min-free-gb 20 \
+  --artifact-health-check \
+  --no-timeout
+
+CUDA_VISIBLE_DEVICES=0 python scripts/run_real_small_5k.py \
+  --variant csdm_w01 \
+  --base-output-dir /tmp/csdm_real_small_5k_csdm \
+  --storage-min-free-gb 20 \
+  --artifact-health-check \
+  --no-timeout
+```
+
+The runner also accepts `--cuda-visible-devices` if you prefer the wrapper to
+set the environment for the registered subprocess. `--storage-min-free-gb`
+forwards the same train preflight guard to fail before model setup when the
+checkpoint/cache filesystem is too full. `--artifact-health-check` scans
+checkpoint/cache `.pt` files after training and before optional eval/report
+steps. Downloads remain disabled by default through `local_files_only: true`;
+use `--allow-downloads` only when network access is intentional.
+
+For the longer 20k pilot launcher, `scripts/run_main20k.sh` applies the same
+guardrails by default: it writes runs under `/mnt/sda2`, requires 20 GiB of
+free checkpoint/cache storage unless `CSDM_STORAGE_MIN_FREE_GB` is overridden,
+uses `--no-timeout`, and runs a sampled artifact-health check after each
+registered training job. The default cache health sample is 64 files plus all
+checkpoints, configurable with `CSDM_ARTIFACT_HEALTH_CACHE_SAMPLE_SIZE`. The
+launcher waits for both parallel KD and CSDM jobs before deciding whether to
+continue, and it skips the top-k run if either prerequisite job exits nonzero.
+
+## Stage 11A Controlled 7B-Teacher Top-k Sanity
+
+Stage 11A adds manual 7B-teacher sanity configs and a small runner. It is
+configuration/orchestration only: it reuses the existing CE, KD, CSDM,
+checkpoint, run-registry, and perturbation-eval code paths without changing
+training math, teacher behavior, or Mamba internals.
+
+These runs target the selected-vocabulary objective from the real-small
+experiments. `csdm_topk` is the main CSDM candidate and `kd_topk` is the
+controlled top-k KD baseline. Top-k KD/CSDM metrics are renormalized
+selected-vocabulary diagnostics; do not treat them as interchangeable with
+full-vocab KL or perplexity.
+
+Required environment variables:
+
+```bash
+export CSDM_TEACHER_PATH=/path/to/local-or-hf-7b
+export CSDM_TOKENIZER_PATH=/path/to/local-or-hf-tokenizer
+export CSDM_DATA_PATH=/path/to/real_corpus.txt
+```
+
+Downloads are disabled by default with `local_files_only: true`. Use
+`--allow-downloads` only when network access is intentional. Teacher logit
+caching is disabled by default for these configs because full teacher logits
+from a 7B model can create large cache/storage pressure and introduce cache
+compatibility confounds.
+
+Starting setup:
+
+- `seq_len=128`
+- `max_steps=100`
+- `top_k=256`
+- `student_hidden_size=128`
+- `student_num_layers=4`
+- `gradient_accumulation_steps=16`
+
+Dry-run both variants without requiring local model/data paths:
+
+```bash
+python scripts/run_7b_sanity.py --variant all --dry-run
+python scripts/run_ablation_matrix.py \
+  --matrix configs/ablations/7b_sanity_topk.yaml \
+  --dry-run
+```
+
+Manual run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python scripts/run_7b_sanity.py \
+  --variant csdm_topk \
+  --base-output-dir /tmp/csdm_7b_sanity \
+  --max-steps 100 \
+  --with-perturbation \
+  --with-report \
+  --no-timeout
+```
+
+Scale up only after the 100-step sanity run completes and perturbation metrics
+are checkpoint-backed: `100` sanity steps, then a `1000`-step pilot, then a
+`5000`-step controlled comparison. Keep the top-k and full-vocab conclusions
+separate when interpreting results.
 
 ## Stage 6B Mamba Dependency Diagnostics
 

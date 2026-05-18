@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
+from utils.logit_cache import (
+    LogitCacheConfig,
+    LogitCacheEntry,
+    LogitCacheLoadError,
+    TeacherLogitCache,
+)
 
 
 def _cache(tmp_path, **kwargs) -> TeacherLogitCache:
@@ -75,6 +80,35 @@ def test_get_or_compute_computes_once_then_loads(tmp_path) -> None:
     assert first.logits is not None
     assert second.logits is not None
     assert torch.equal(first.logits, second.logits)
+
+
+def test_load_corrupt_cache_entry_raises_clear_error(tmp_path) -> None:
+    cache = _cache(tmp_path, dtype="float32")
+    (tmp_path / "bad.pt").write_bytes(b"not a torch checkpoint")
+
+    with pytest.raises(LogitCacheLoadError, match="could not be loaded"):
+        cache.load("bad")
+
+
+def test_get_or_compute_recovers_from_corrupt_cache_entry(tmp_path) -> None:
+    cache = _cache(tmp_path, dtype="float32")
+    input_ids = torch.tensor([[1, 2, 3]])
+    key = cache.make_key(input_ids)
+    cache._path_for_key(key).write_bytes(b"partial cache file")
+    calls = {"count": 0}
+
+    def compute_fn(input_ids, attention_mask=None):
+        calls["count"] += 1
+        return torch.full((*input_ids.shape, 4), 3.0)
+
+    entry = cache.get_or_compute(input_ids, compute_fn)
+    loaded = cache.load(key)
+
+    assert calls["count"] == 1
+    assert entry.logits is not None
+    assert loaded.logits is not None
+    assert torch.equal(entry.logits, torch.full((*input_ids.shape, 4), 3.0))
+    assert torch.equal(loaded.logits, entry.logits)
 
 
 def test_overwrite_true_recomputes(tmp_path) -> None:

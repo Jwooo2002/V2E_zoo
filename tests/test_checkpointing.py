@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from utils.checkpointing import (
+    CheckpointLoadError,
     TrainingCheckpointState,
     latest_checkpoint,
     load_checkpoint,
@@ -35,6 +36,25 @@ def test_save_and_load_checkpoint_wrappers_preserve_dict(tmp_path) -> None:
 
     assert loaded["name"] == "plain"
     assert torch.equal(loaded["value"], torch.tensor([1, 2, 3]))
+
+
+def test_save_checkpoint_replaces_existing_file_atomically(tmp_path) -> None:
+    path = tmp_path / "plain.pt"
+    save_checkpoint(path, {"value": torch.tensor([1])})
+    save_checkpoint(path, {"value": torch.tensor([2])})
+
+    loaded = load_checkpoint(path)
+
+    assert torch.equal(loaded["value"], torch.tensor([2]))
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_load_checkpoint_wraps_corrupt_file_error(tmp_path) -> None:
+    path = tmp_path / "corrupt.pt"
+    path.write_bytes(b"partial checkpoint")
+
+    with pytest.raises(CheckpointLoadError, match="could not be loaded"):
+        load_checkpoint(path)
 
 
 def test_save_training_checkpoint_creates_file_and_roundtrips_metadata(tmp_path) -> None:
@@ -69,6 +89,23 @@ def test_save_training_checkpoint_creates_file_and_roundtrips_metadata(tmp_path)
     assert state.config == {"batch_size": 2}
     assert state.metadata == {"run": "mock"}
     assert state.path == path
+
+
+def test_save_training_checkpoint_does_not_leave_temp_file(tmp_path) -> None:
+    student, optimizer, _scheduler = _trained_components()
+
+    path = save_training_checkpoint(
+        tmp_path,
+        student=student,
+        optimizer=optimizer,
+        step=1,
+        optimizer_step=1,
+        config=None,
+        metadata=None,
+    )
+
+    assert path.is_file()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_load_training_checkpoint_restores_student_optimizer_and_scheduler(tmp_path) -> None:

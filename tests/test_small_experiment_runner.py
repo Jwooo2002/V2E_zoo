@@ -41,6 +41,7 @@ def test_overrides_are_typed_and_mapped_to_train_flags(tmp_path: Path) -> None:
             "topk_enabled=false",
             "teacher_cache_enabled=true",
             "csdm_weight=0.05",
+            "storage_min_free_gb=12.5",
             f"checkpoint_output_dir={tmp_path / 'ckpt'}",
         ],
     )
@@ -52,6 +53,7 @@ def test_overrides_are_typed_and_mapped_to_train_flags(tmp_path: Path) -> None:
     assert command[command.index("--config") + 1] == "configs/train_config.yaml"
     assert command[command.index("--max_steps") + 1] == "3"
     assert command[command.index("--csdm-weight") + 1] == "0.05"
+    assert command[command.index("--storage-min-free-gb") + 1] == "12.5"
     assert "--no-topk-enabled" in command
     assert "--teacher-cache-enabled" in command
     assert str(tmp_path / "ckpt") in command

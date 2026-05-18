@@ -26,6 +26,9 @@ KEY_TO_FLAG: dict[str, str | None] = {
     "teacher_model_name_or_path": "--teacher-model-name-or-path",
     "hf_torch_dtype": "--hf-torch-dtype",
     "hf_device_map": "--hf-device-map",
+    "device_map": "--hf-device-map",
+    "trust_remote_code": "--trust-remote-code",
+    "use_safetensors": "--use-safetensors",
     "dataset_type": "--dataset-type",
     "data_path": "--data-path",
     "tokenizer_name_or_path": "--tokenizer-name-or-path",
@@ -71,10 +74,13 @@ KEY_TO_FLAG: dict[str, str | None] = {
     "distributed": "--distributed",
     "distributed_backend": "--distributed-backend",
     "ddp_find_unused_parameters": "--ddp-find-unused-parameters",
+    "storage_min_free_gb": "--storage-min-free-gb",
 }
 
 BOOLEAN_OPTIONAL_KEYS = {
     "allow_student_vocab_resize",
+    "trust_remote_code",
+    "use_safetensors",
     "off_state_detach_direction",
     "topk_enabled",
     "topk_include_labels",
