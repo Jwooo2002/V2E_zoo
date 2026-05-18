@@ -604,14 +604,16 @@ Distributed behavior:
 
 - `--distributed-mode env` reads `RANK`, `LOCAL_RANK`, and `WORLD_SIZE` from
   a torchrun/Accelerate-style environment;
-- `--distributed-mode ddp` is reserved and currently raises a clear
-  `NotImplementedError`;
-- Stage 7E does not wrap the student with `DistributedDataParallel` yet;
-- training data may be rank-partitioned for smoke runs, but this is still
-  preparation scaffolding rather than production distributed training;
+- `--distributed-mode ddp` initializes a torch distributed process group and
+  wraps only the student with `DistributedDataParallel`;
+- the teacher remains frozen and still consumes only clean `input_ids` and
+  `attention_mask`;
+- training data is rank-partitioned with `DistributedSampler`;
 - JSON metric logging and checkpoint writes happen only on global rank zero;
 - teacher cache paths become rank-local, for example
   `/tmp/cache/rank_00000` and `/tmp/cache/rank_00001`;
+- DDP unused-parameter detection is enabled by default because some mock and
+  real-Mamba heads are intentionally objective-dependent;
 - effective batch size is logged as
   `batch_size * gradient_accumulation_steps * world_size`.
 

@@ -91,11 +91,14 @@ def test_mock_teacher_returns_frozen_no_grad_logits_with_attention_mask() -> Non
     assert all(not parameter.requires_grad for parameter in teacher.parameters())
 
 
-def test_dtype_parser_maps_supported_strings_and_cpu_fallback() -> None:
+def test_dtype_parser_maps_supported_strings_and_cpu_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     assert parse_torch_dtype("float32") is torch.float32
     assert parse_torch_dtype("float16", device_map="cuda") is torch.float16
     assert parse_torch_dtype("bfloat16", device_map="cuda") is torch.bfloat16
     assert parse_torch_dtype("float16", device_map="cpu") is torch.float32
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert parse_torch_dtype("bfloat16", device_map=None) is torch.bfloat16
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert parse_torch_dtype("bfloat16", device_map=None) is torch.float32
 
     with pytest.raises(ValueError, match="Unsupported torch_dtype"):

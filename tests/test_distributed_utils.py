@@ -90,6 +90,65 @@ def test_init_distributed_env_requires_rank_values(monkeypatch: pytest.MonkeyPat
         init_distributed(mode="env")
 
 
+def test_init_distributed_ddp_initializes_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"initialized": False, "init_backend": None, "destroyed": False}
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: state["initialized"])
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def fake_init_process_group(*, backend: str, init_method: str) -> None:
+        state["initialized"] = True
+        state["init_backend"] = backend
+        state["init_method"] = init_method
+
+    def fake_destroy_process_group() -> None:
+        state["destroyed"] = True
+        state["initialized"] = False
+
+    monkeypatch.setattr(torch.distributed, "init_process_group", fake_init_process_group)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", fake_destroy_process_group)
+
+    context = init_distributed(mode="ddp", backend="gloo")
+
+    assert context.enabled is True
+    assert context.rank == 1
+    assert context.world_size == 2
+    assert context.backend == "gloo"
+    assert context.process_group_initialized_by_us is True
+    assert state["init_backend"] == "gloo"
+    assert state["init_method"] == "env://"
+
+    from utils.distributed import cleanup_distributed
+
+    cleanup_distributed(context)
+
+    assert state["destroyed"] is True
+
+
+def test_init_distributed_env_does_not_initialize_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    def fail_init_process_group(*args, **kwargs) -> None:
+        raise AssertionError("env mode should not initialize a process group")
+
+    monkeypatch.setattr(torch.distributed, "init_process_group", fail_init_process_group)
+
+    context = init_distributed(mode="env", backend="gloo")
+
+    assert context.enabled is True
+    assert context.process_group_initialized_by_us is False
+
+
 def test_get_device_for_rank_returns_cpu_when_cuda_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 

@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -43,6 +44,7 @@ from utils.distributed import (
     effective_batch_size,
     init_distributed,
     rank_local_dir,
+    unwrap_model,
 )
 from utils.logit_cache import LogitCacheConfig, LogitCacheEntry, TeacherLogitCache
 from utils.logger import ConsoleLogger
@@ -134,7 +136,7 @@ class CheckpointConfig:
 class DistributedConfig:
     mode: str = "none"
     backend: str | None = None
-    find_unused_parameters: bool = False
+    find_unused_parameters: bool = True
 
 
 @dataclass(frozen=True)
@@ -276,7 +278,7 @@ def parse_args() -> argparse.Namespace:
         "--distributed-mode",
         choices=("none", "env", "ddp"),
         default=None,
-        help="Stage 7E distributed scaffold mode. 'env' is rank-aware without DDP; 'ddp' is reserved.",
+        help="'env' is rank-aware without wrapping; 'ddp' initializes torch.distributed and wraps the student.",
     )
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--distributed-backend", choices=("nccl", "gloo"), default=None)
@@ -1064,6 +1066,72 @@ def _build_student(config: TrainConfig, teacher_vocab_size: int, device: torch.d
     raise ValueError(f"Unsupported student_type {config.student_type!r}.")
 
 
+class _DDPStudentForwardWrapper(nn.Module):
+    """Return a DDP-friendly tensor tuple while preserving the student module."""
+
+    def __init__(self, student: StudentMamba) -> None:
+        super().__init__()
+        self.student = student
+
+    def forward(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        output = self.student(input_ids)
+        return output.on_logits, output.off_logits, output.fake_logits
+
+
+def _wrap_student_for_distributed(
+    student: StudentMamba,
+    *,
+    config: TrainConfig,
+    distributed: DistributedContext,
+) -> nn.Module:
+    if config.distributed.mode != "ddp" or not distributed.enabled:
+        return student
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("--distributed-mode ddp requires an initialized torch.distributed process group.")
+    wrapped_student = _DDPStudentForwardWrapper(student)
+    if distributed.device.type == "cuda":
+        return DistributedDataParallel(
+            wrapped_student,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+            find_unused_parameters=config.distributed.find_unused_parameters,
+        )
+    return DistributedDataParallel(
+        wrapped_student,
+        find_unused_parameters=config.distributed.find_unused_parameters,
+    )
+
+
+def _student_forward_context(student: nn.Module, *, micro_step: int, accumulation_steps: int) -> Any:
+    if isinstance(student, DistributedDataParallel) and micro_step < accumulation_steps:
+        return student.no_sync()
+    return nullcontext()
+
+
+def _student_output_from_forward(value: StudentOutput | tuple[Tensor, Tensor, Tensor]) -> StudentOutput:
+    if isinstance(value, StudentOutput):
+        return value
+    if isinstance(value, tuple) and len(value) == 3:
+        on_logits, off_logits, fake_logits = value
+        return StudentOutput(
+            on_logits=on_logits,
+            off_logits=off_logits,
+            fake_logits=fake_logits,
+            h=None,
+            h_off=None,
+            h_delta_alt=None,
+            metadata={"ddp_forward_tuple": True},
+        )
+    raise TypeError(f"student forward returned unsupported type {type(value).__name__}.")
+
+
+def _unwrap_student_for_checkpoint(student: nn.Module) -> nn.Module:
+    module = unwrap_model(student)
+    if isinstance(module, _DDPStudentForwardWrapper):
+        return module.student
+    return module
+
+
 def _effective_student_vocab_size(config: TrainConfig, teacher_vocab_size: int) -> int:
     if config.student_type == "mock":
         return teacher_vocab_size
@@ -1378,14 +1446,14 @@ def _load_resume_state_if_needed(
 def _save_training_state(
     config: TrainConfig,
     *,
-    student: StudentMamba,
+    student: nn.Module,
     optimizer: torch.optim.Optimizer,
     step: int,
     metadata: dict[str, Any],
 ) -> Path:
     return save_training_checkpoint(
         config.checkpoint.output_dir,
-        student,
+        _unwrap_student_for_checkpoint(student),
         optimizer,
         step=step,
         optimizer_step=step,
@@ -1561,6 +1629,7 @@ def _run_training_inner(
         _advance_batches(batches, start_optimizer_step * config.gradient_accumulation_steps)
     if start_optimizer_step >= max_steps:
         return
+    student = _wrap_student_for_distributed(student, config=config, distributed=distributed)
     for step in range(start_optimizer_step + 1, max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         accum_metrics = {"total": 0.0, "ce": 0.0, "kd": 0.0, "csdm": 0.0}
@@ -1581,30 +1650,35 @@ def _run_training_inner(
                 attention_mask = attention_mask.to(device)
             elif config.teacher_type == "hf":
                 attention_mask = torch.ones_like(input_ids)
-            with autocast_context:
-                if teacher_cache is None:
-                    teacher_logits = teacher(input_ids, attention_mask=attention_mask)
-                else:
-                    entry = teacher_cache.get_or_compute(
-                        input_ids,
-                        compute_fn=lambda clean_input_ids, attention_mask=None: teacher(
-                            clean_input_ids,
+            with _student_forward_context(
+                student,
+                micro_step=micro_step,
+                accumulation_steps=config.gradient_accumulation_steps,
+            ):
+                with autocast_context:
+                    if teacher_cache is None:
+                        teacher_logits = teacher(input_ids, attention_mask=attention_mask)
+                    else:
+                        entry = teacher_cache.get_or_compute(
+                            input_ids,
+                            compute_fn=lambda clean_input_ids, attention_mask=None: teacher(
+                                clean_input_ids,
+                                attention_mask=attention_mask,
+                            ),
                             attention_mask=attention_mask,
-                        ),
-                        attention_mask=attention_mask,
-                        extra=teacher_cache_extra,
-                    )
-                    teacher_logits = _teacher_logits_from_cache_entry(entry)
-                output = student(input_ids)
-                loss_device = output.on_logits.device
-                teacher_logits = teacher_logits.to(loss_device)
-                labels = labels.to(loss_device)
-                losses = compute_losses(output, teacher_logits, labels, config)
-                for name, value in losses.items():
-                    if not torch.isfinite(value):
-                        raise FloatingPointError(f"non-finite {name} loss encountered before backward")
-                scaled_loss = losses["total"] / config.gradient_accumulation_steps
-            scaled_loss.backward()
+                            extra=teacher_cache_extra,
+                        )
+                        teacher_logits = _teacher_logits_from_cache_entry(entry)
+                    output = _student_output_from_forward(student(input_ids))
+                    loss_device = output.on_logits.device
+                    teacher_logits = teacher_logits.to(loss_device)
+                    labels = labels.to(loss_device)
+                    losses = compute_losses(output, teacher_logits, labels, config)
+                    for name, value in losses.items():
+                        if not torch.isfinite(value):
+                            raise FloatingPointError(f"non-finite {name} loss encountered before backward")
+                    scaled_loss = losses["total"] / config.gradient_accumulation_steps
+                scaled_loss.backward()
             for name in accum_metrics:
                 accum_metrics[name] += float(losses[name].detach().cpu())
 

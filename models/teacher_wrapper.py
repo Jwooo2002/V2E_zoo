@@ -80,7 +80,11 @@ class HuggingFaceTeacherConfig:
 
 
 def parse_torch_dtype(torch_dtype: str, device_map: str | None = "auto") -> torch.dtype:
-    """Parse config dtype strings, falling back to fp32 for CPU execution."""
+    """Parse config dtype strings, falling back to fp32 for CPU execution.
+
+    ``device_map=None`` is used for rank-local CUDA loading in DDP, so it should
+    only be treated as CPU-like when CUDA is unavailable.
+    """
 
     dtype_map = {
         "float32": torch.float32,
@@ -93,8 +97,7 @@ def parse_torch_dtype(torch_dtype: str, device_map: str | None = "auto") -> torc
         allowed = ", ".join(sorted(dtype_map))
         raise ValueError(f"Unsupported torch_dtype {torch_dtype!r}; expected one of: {allowed}.") from exc
 
-    cpu_device_map = device_map is None or device_map == "cpu"
-    likely_cpu = cpu_device_map or (device_map == "auto" and not torch.cuda.is_available())
+    likely_cpu = device_map == "cpu" or (device_map in {None, "auto"} and not torch.cuda.is_available())
     if likely_cpu and dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
     return dtype

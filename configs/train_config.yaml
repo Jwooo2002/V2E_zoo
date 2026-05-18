@@ -9,7 +9,7 @@ max_grad_norm: 1.0
 distributed:
   mode: none
   backend:
-  find_unused_parameters: false
+  find_unused_parameters: true
 
 storage:
   min_free_gb: 0.0

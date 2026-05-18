@@ -35,3 +35,4 @@ checkpoints/
 data/raw/
 data/processed/
 data/real_small_corpus.txt
+data/real_small_corpus_clean.txt

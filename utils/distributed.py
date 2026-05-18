@@ -21,6 +21,7 @@ class DistributedContext:
     world_size: int = 1
     backend: str | None = None
     device: torch.device = torch.device("cpu")
+    process_group_initialized_by_us: bool = False
 
     @property
     def is_rank_zero(self) -> bool:
@@ -92,7 +93,14 @@ def init_distributed(
     if world_size <= 1:
         rank = get_rank()
         local_rank = get_local_rank()
-        return DistributedContext(enabled=False, rank=rank, local_rank=local_rank, world_size=world_size, device=get_device_for_rank())
+        return DistributedContext(
+            enabled=False,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            backend=backend,
+            device=get_device_for_rank(),
+        )
     if not _dist_initialized():
         missing = [name for name in ("RANK", "LOCAL_RANK") if os.environ.get(name) in (None, "")]
         if missing:
@@ -100,13 +108,20 @@ def init_distributed(
                 "Distributed env mode requires RANK and LOCAL_RANK when WORLD_SIZE > 1; "
                 f"missing: {', '.join(missing)}."
             )
-    rank = get_rank()
+
+    selected_backend = backend or ("nccl" if torch.cuda.is_available() else "gloo")
     local_rank = get_local_rank()
-    selected_backend = backend
     device = get_device_for_rank()
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+    initialized_by_us = False
+    if mode == "ddp" and not _dist_initialized():
+        torch.distributed.init_process_group(backend=selected_backend, init_method="env://")
+        initialized_by_us = True
+
+    rank = get_rank()
+    world_size = get_world_size()
     return DistributedContext(
         enabled=True,
         rank=rank,
@@ -114,11 +129,13 @@ def init_distributed(
         world_size=world_size,
         backend=selected_backend,
         device=device,
+        process_group_initialized_by_us=initialized_by_us,
     )
 
 
 def cleanup_distributed(context: DistributedContext) -> None:
-    return None
+    if context.process_group_initialized_by_us and _dist_initialized():
+        torch.distributed.destroy_process_group()
 
 
 def barrier(context: DistributedContext | None = None) -> None:
