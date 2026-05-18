@@ -1108,11 +1108,13 @@ def _validate_vocab_for_training(
                 f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}, student={student_vocab_size}."
             ) from exc
         raise ValueError(
-            "vocab sizes must match for smoke training before token generation: "
+            "vocab sizes must match for teacher/student training alignment: "
             f"tokenizer={tokenizer_vocab_size}, teacher={teacher_vocab_size}, "
             f"student={student_vocab_size}. "
-            "Use one tokenizer/model vocabulary, omit --student-vocab-size to align the "
-            "student automatically when supported, or enable an explicit resize path later. "
+            "Teacher and student logits must share a vocab size. Tokenizer vocab may be "
+            "smaller than the model vocab for padded embedding/logit tables, but it must "
+            "not exceed the model vocab. Omit --student-vocab-size to align the student "
+            "automatically when supported, or enable an explicit resize path later. "
             f"{exc}"
         ) from exc
 
@@ -1570,7 +1572,8 @@ def _run_training_inner(
             validate_token_id_ranges(
                 input_ids,
                 labels,
-                vocab_size=teacher_vocab_size,
+                input_vocab_size=tokenizer_vocab_size or teacher_vocab_size,
+                label_vocab_size=teacher_vocab_size,
                 ignored_label_id=config.vocab.ignored_label_id,
             )
             attention_mask = batch.get("attention_mask")

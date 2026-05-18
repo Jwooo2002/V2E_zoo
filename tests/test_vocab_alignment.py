@@ -114,15 +114,53 @@ def test_validate_vocab_alignment_passes_matching_sizes() -> None:
     assert report.student_vocab_size == 11
     assert report.pad_token_id == 0
     assert report.eos_token_id == 1
+    assert report.padded_model_vocab is False
+    assert report.vocab_padding == 0
 
 
-def test_validate_vocab_alignment_rejects_mismatch_in_strict_mode() -> None:
-    with pytest.raises(ValueError, match="tokenizer and teacher vocab sizes must match"):
+def test_validate_vocab_alignment_allows_padded_model_vocab() -> None:
+    report = validate_vocab_alignment(
+        tokenizer_vocab_size=151665,
+        teacher_vocab_size=152064,
+        student_vocab_size=152064,
+        pad_token_id=151643,
+        eos_token_id=151645,
+    )
+
+    assert report.valid
+    assert report.padded_model_vocab is True
+    assert report.vocab_padding == 399
+    assert any("model vocab as padded" in warning for warning in report.warnings)
+
+
+def test_validate_vocab_alignment_rejects_tokenizer_larger_than_model() -> None:
+    with pytest.raises(ValueError, match="must not exceed teacher vocab size"):
         validate_vocab_alignment(
-            tokenizer_vocab_size=12,
-            teacher_vocab_size=11,
-            student_vocab_size=11,
+            tokenizer_vocab_size=152065,
+            teacher_vocab_size=152064,
+            student_vocab_size=152064,
             strict=True,
+        )
+
+
+def test_validate_vocab_alignment_rejects_teacher_student_mismatch_with_padded_tokenizer() -> None:
+    with pytest.raises(ValueError, match="teacher and student vocab sizes must match"):
+        validate_vocab_alignment(
+            tokenizer_vocab_size=151665,
+            teacher_vocab_size=152064,
+            student_vocab_size=151665,
+            strict=True,
+        )
+
+
+def test_validate_vocab_alignment_can_disallow_padded_model_vocab() -> None:
+    with pytest.raises(ValueError, match="padded model vocab is disabled"):
+        validate_vocab_alignment(
+            tokenizer_vocab_size=151665,
+            teacher_vocab_size=152064,
+            student_vocab_size=152064,
+            strict=True,
+            allow_padded_model_vocab=False,
         )
 
 
@@ -138,6 +176,19 @@ def test_validate_vocab_alignment_non_strict_returns_errors_without_raising() ->
     assert report.errors
 
 
+def test_validate_vocab_alignment_non_strict_reports_padded_vocab() -> None:
+    report = validate_vocab_alignment(
+        tokenizer_vocab_size=151665,
+        teacher_vocab_size=152064,
+        student_vocab_size=152064,
+        strict=False,
+    )
+
+    assert report.valid
+    assert report.padded_model_vocab is True
+    assert report.vocab_padding == 399
+
+
 def test_validate_vocab_alignment_rejects_added_pad_token_out_of_range() -> None:
     with pytest.raises(ValueError, match="pad_token_id=11"):
         validate_vocab_alignment(
@@ -145,6 +196,34 @@ def test_validate_vocab_alignment_rejects_added_pad_token_out_of_range() -> None
             teacher_vocab_size=11,
             student_vocab_size=11,
             pad_token_id=11,
+        )
+
+
+def test_validate_token_id_ranges_uses_tokenizer_for_inputs_and_model_for_labels() -> None:
+    validate_token_id_ranges(
+        input_ids=torch.tensor([[0, 151664]]),
+        labels=torch.tensor([[151665, -100]]),
+        input_vocab_size=151665,
+        label_vocab_size=152064,
+        ignored_label_id=-100,
+    )
+
+    with pytest.raises(ValueError, match="input_ids contain token id"):
+        validate_token_id_ranges(
+            input_ids=torch.tensor([[151665]]),
+            labels=torch.tensor([[-100]]),
+            input_vocab_size=151665,
+            label_vocab_size=152064,
+            ignored_label_id=-100,
+        )
+
+    with pytest.raises(ValueError, match="labels contain token id"):
+        validate_token_id_ranges(
+            input_ids=torch.tensor([[0]]),
+            labels=torch.tensor([[152064]]),
+            input_vocab_size=151665,
+            label_vocab_size=152064,
+            ignored_label_id=-100,
         )
 
 

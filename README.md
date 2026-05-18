@@ -424,8 +424,11 @@ shared token support used by CE, KD, and CSDM.
 The training setup now checks:
 
 - tokenizer length, teacher-logit vocab size, and student-logit vocab size;
-- pad/eos token ids against the selected vocabulary;
-- per-batch `input_ids` and non-ignored labels are in `[0, vocab_size)`;
+- pad/eos token ids against the tokenizer vocabulary when known, or model
+  vocabulary otherwise;
+- per-batch `input_ids` are in `[0, tokenizer_vocab_size)` when a tokenizer is
+  used;
+- non-ignored labels are in `[0, teacher_vocab_size)`;
 - teacher, on-student, off-student, and fake-student logits still share shape.
 
 Strict alignment is enabled by default:
@@ -437,11 +440,19 @@ vocab:
   ignored_label_id: -100
 ```
 
-If a pad-token strategy adds a new token, the tokenizer length may no longer
-match the teacher or student embeddings. Stage 7B raises a clear error in that
-case instead of silently resizing, truncating, or remapping token ids. Use a
-tokenizer/model pair with matching vocabularies, or implement an explicit
-student resize path before enabling `allow_student_vocab_resize`.
+Qwen-style padded model vocabularies are supported when the teacher and student
+model vocab sizes match and the tokenizer vocab is smaller than or equal to
+that shared model vocab. The vocab report records `padded_model_vocab` and
+`vocab_padding`; per-batch `input_ids` are checked against the tokenizer vocab
+when known, while non-ignored labels are checked against the teacher/student
+model vocab.
+
+If a pad-token strategy adds a new token beyond the model vocab, if
+`tokenizer_vocab_size > teacher_vocab_size`, or if teacher and student vocab
+sizes differ, Stage 7B raises a clear error instead of silently resizing,
+truncating, or remapping token ids. Use a tokenizer/model pair with compatible
+vocabularies, or implement an explicit student resize path before enabling
+`allow_student_vocab_resize`.
 
 Matching tokenizer/teacher example:
 
