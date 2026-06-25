@@ -1,0 +1,36 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.so
+build/
+.pytest_cache/
+
+# IDE/local metadata
+.idea/
+.agents/
+.codex/
+
+# Generated outputs
+video/results/
+image/results/
+image/results_*/
+video/**/output/
+image/**/output/
+
+# Local media inputs and generated media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Large model/data artifacts.
+# Use Git LFS or external storage for these if they must be shared.
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.h5
+*.zip
+
+# Temporary batch inputs
+/tmp/
