@@ -33,6 +33,19 @@ V2E_zoo/
 
 공통 conda 환경 이름은 `V2E_zoo_video`입니다.
 
+검증한 Python 버전:
+
+```text
+Python 3.9.25
+```
+
+권장 생성 방식:
+
+```bash
+conda create -n V2E_zoo_video python=3.9
+conda activate V2E_zoo_video
+```
+
 ```bash
 conda activate V2E_zoo_video
 ```
@@ -52,6 +65,12 @@ image/requirements.txt
 ```
 
 `requirements.txt`는 video 모델 세팅 때 정리한 공통 requirements입니다. `image/requirements.txt`에는 image 쪽에서 추가로 필요한 패키지까지 포함되어 있습니다.
+
+주의:
+
+- I2E 원본 README는 Python 3.10을 권장하지만, 이 zoo runner의 smoke test는 Python 3.9.25에서 통과했습니다.
+- EventGAN은 오래된 코드라 너무 최신 Python보다 Python 3.9 환경에서 맞추는 편이 안전합니다.
+- 따라서 이 repo 전체 실행 기준 권장 Python은 `3.9`입니다.
 
 ## Weight / Checkpoint
 

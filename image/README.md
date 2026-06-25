@@ -25,6 +25,19 @@ image/
 
 기존 video 쪽에서 만든 conda 환경을 그대로 사용합니다.
 
+검증한 Python 버전:
+
+```text
+Python 3.9.25
+```
+
+권장 생성 방식:
+
+```bash
+conda create -n V2E_zoo_video python=3.9
+conda activate V2E_zoo_video
+```
+
 ```bash
 conda activate V2E_zoo_video
 ```
@@ -40,6 +53,12 @@ conda run -n V2E_zoo_video python image/run_i2e.py --help
 ```bash
 conda run -n V2E_zoo_video python -m pip install -r image/requirements.txt
 ```
+
+주의:
+
+- I2E 원본 README는 Python 3.10을 권장하지만, 여기의 `run_i2e.py` smoke test는 Python 3.9.25에서 통과했습니다.
+- EventGAN은 2019년 코드라 최신 Python보다는 Python 3.9 환경이 안전합니다.
+- 이 image runner 묶음의 권장 Python은 `3.9`입니다.
 
 ## Weight / Checkpoint
 
