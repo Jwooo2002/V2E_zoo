@@ -1,11 +1,20 @@
+# Image-side requirements for I2E, EventGAN, and TETCI_byeongjun.
+# The root requirements.txt already includes these. This file is kept for
+# image-only setup:
+#   python -m pip install -r image/requirements.txt
+
+numpy==1.23.5
+opencv-python==4.8.0.76
+Pillow==9.4.0
+matplotlib==3.7.2
+h5py==3.9.0
+tqdm==4.64.1
+
 torch==2.1.2
 torchvision==0.16.2
-numpy==1.19.5
-opencv-python==4.5.5.64
-h5py==3.1.0
-matplotlib
-tqdm
-tensorboardX
+torchaudio==2.1.2
+tensorboardX==2.6.2.2
 timm==1.0.19
-spikingjelly
-snntorch
+spikingjelly==0.0.0.0.14
+snntorch==0.9.4
+IPython==8.18.1

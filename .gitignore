@@ -1,8 +1,6 @@
 # Python/cache
 __pycache__/
 *.py[cod]
-*.so
-build/
 .pytest_cache/
 
 # IDE/local metadata
@@ -31,6 +29,9 @@ image/**/output/
 *.pkl
 *.h5
 *.zip
+*.so
+*.dylib
+*.dll
 
 # Temporary batch inputs
 /tmp/
