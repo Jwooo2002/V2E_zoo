@@ -38,14 +38,14 @@ easygui==0.98.3
 dv-processing>=1.7.8,<2.0
 
 tensorflow==2.15.1
-tensorflow-addons==0.23.0
-tensorflow-datasets==4.9.4
-tensorflow-metadata==1.15.0
+tensorflow-addons==0.22.0
+tensorflow-datasets==4.9.3
+tensorflow-metadata==1.14.0
 gin-config==0.5.0
 mediapy==1.1.9
 protobuf==3.20.3
-google-api-core==2.15.0
-google-auth==2.25.2
+google-api-core==2.11.1
+google-auth==2.23.4
 google-auth-oauthlib==1.0.0
 googleapis-common-protos==1.61.0
 
