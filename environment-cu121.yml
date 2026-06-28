@@ -1,6 +1,0 @@
-name: cdm-mamba-kd-cu121
-channels:
-  - defaults
-dependencies:
-  - python=3.10
-prefix: /home/jiwoong/anaconda3/envs/cdm-mamba-kd-cu121

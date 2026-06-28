@@ -1,3 +1,0 @@
-CSDM Mamba KD smoke text.
-The teacher reads clean token prefixes.
-The student predicts from token IDs and student-side states.

@@ -1,38 +1,37 @@
-# Python
+# Python/cache
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# Virtual envs
-.venv/
-venv/
-env/
-
-# IDE
+# IDE/local metadata
 .idea/
-.vscode/
+.agents/
+.codex/
 
-# OS
-.DS_Store
+# Generated outputs
+video/results/
+image/results/
+image/results_*/
+video/**/output/
+image/**/output/
 
-# Logs / outputs
-logs/
-runs/
-outputs/
-checkpoints/
-*.log
+# Local media inputs and generated media
+*.mp4
+*.avi
+*.mov
+*.mkv
 
-# Large model/data files
+# Large model/data artifacts.
+# Use Git LFS or external storage for these if they must be shared.
 *.pt
 *.pth
 *.ckpt
-*.safetensors
-*.bin
-data/raw/
-data/processed/
-data/real_small_corpus.txt
-data/real_small_corpus_clean.txt
+*.pkl
+*.h5
+*.zip
+*.so
+*.dylib
+*.dll
+
+# Temporary batch inputs
+/tmp/
